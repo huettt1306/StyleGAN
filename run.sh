@@ -1,0 +1,8 @@
+#!/bin/bash
+
+: ${NODES:=2}
+
+salloc -N $NODES --partition getp --exclusive --gres=gpu:4   \
+	mpirun --bind-to none -mca btl ^openib -npernode 1 \
+		--oversubscribe -quiet \
+		./main $@
