@@ -90,13 +90,16 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   int K = weight->shape[0], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
-  #pragma omp parallel for collapse(4)
+  // Clear output buffer
+  memset(output->buf, 0, N * K * OH * OW * sizeof(float));
+
+  #pragma omp parallel for collapse(2)
   for (int n = 0; n < N; ++n) {
     for (int k = 0; k < K; ++k) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          float o = has_bias ? bias->buf[k] : 0;
-          for (int c = 0; c < C; ++c) {
+      for (int c = 0; c < C; ++c) {
+        for (int oh = 0; oh < OH; ++oh) {
+          for (int ow = 0; ow < OW; ++ow) {
+            float o = has_bias ? bias->buf[k] : 0;
             int minr = max(0, (pad - oh * stride + dilation - 1) / dilation);
             int maxr = min(R, (H + pad - oh * stride + dilation - 1) / dilation);
             int mins = max(0, (pad - ow * stride + dilation - 1) / dilation);
@@ -108,8 +111,8 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
                 o += i * f;
               }
             }
+            output->buf[n * K * OH * OW + k * OH * OW + oh * OW + ow] += o;
           }
-          output->buf[n * K * OH * OW + k * OH * OW + oh * OW + ow] = o;
         }
       }
     }
@@ -132,12 +135,14 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
   int K = weight->shape[1], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
-  #pragma omp parallel for collapse(3)
+  memset(output->buf, 0, K * OH * OW * sizeof(float));
+
+  #pragma omp parallel for
   for (int k = 0; k < K; ++k) {
-    for (int oh = 0; oh < OH; ++oh) {
-      for (int ow = 0; ow < OW; ++ow) {
-        float o = 0.0f;
-        for (int c = 0; c < C; ++c) {
+    for (int c = 0; c < C; ++c) {
+      for (int oh = 0; oh < OH; ++oh) {
+        for (int ow = 0; ow < OW; ++ow) {
+          float o = 0.0f;
           int minr = max((oh + pad) % stride, oh + pad - H * stride + stride);
           int maxr = min(oh + pad + 1, R);
           int mins = max((ow + pad) % stride, ow + pad - W * stride + stride);
@@ -150,8 +155,8 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
               o += i * f;
             }
           }
+          output->buf[k * OH * OW + oh * OW + ow] += o;
         }
-        output->buf[k * OH * OW + oh * OW + ow] = o;
       }
     }
   }
