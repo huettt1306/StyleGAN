@@ -97,11 +97,12 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
         for (int ow = 0; ow < OW; ++ow) {
           float o = has_bias ? bias->buf[k] : 0;
           for (int c = 0; c < C; ++c) {
-            for (int r = 0; r < R; ++r) {
-              for (int s = 0; s < S; ++s) {
-                int h = oh * stride - pad + r * dilation;
-                int w = ow * stride - pad + s * dilation;
-                if (h < 0 || h >= H || w < 0 || w >= W) continue;
+            int minr = max(0, (pad - oh * stride + dilation - 1) / dilation);
+            int maxr = min(R, (H + pad - oh * stride + dilation - 1) / dilation);
+            int mins = max(0, (pad - ow * stride + dilation - 1) / dilation);
+            int maxs = min(S, (W + pad - ow * stride + dilation - 1) / dilation);
+            for (int r = minr, h = oh * stride - pad + r * dilation; r < maxr; ++r, h += dilation) {
+              for (int s = mins, w = ow * stride - pad + s * dilation; s < maxs; ++s, w += dilation) {
                 float i = input->buf[n * C * H * W + c * H * W + h * W + w];
                 float f = weight->buf[k * C * R * S + c * R * S + r * S + s];
                 o += i * f;
@@ -137,13 +138,13 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
       for (int ow = 0; ow < OW; ++ow) {
         float o = 0.0f;
         for (int c = 0; c < C; ++c) {
-          for (int r = 0; r < R; ++r) {
-            for (int s = 0; s < S; ++s) {
-              if ((oh + pad - r) % stride != 0) continue;
-              if ((ow + pad - s) % stride != 0) continue;
-              int h = (oh + pad - r) / stride;
-              int w = (ow + pad - s) / stride;
-              if (h < 0 || h >= H || w < 0 || w >= W) continue;
+          int minr = max((oh + pad) % stride, oh + pad - H * stride + stride);
+          int maxr = min(oh + pad + 1, R);
+          int mins = max((ow + pad) % stride, ow + pad - W * stride + stride);
+          int maxs = min(ow + pad + 1, S);
+
+          for (int r = minr, h = (oh + pad - r) / stride; r < maxr; r += stride, h -= 1) {
+            for (int s = mins, w = (ow + pad - s) / stride; s < maxs; s += stride, w -= 1) {
               float i = input->buf[c * H * W + h * W + w];
               float f = weight->buf[c * K * R * S + k * R * S + r * S + s];
               o += i * f;
