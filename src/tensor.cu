@@ -35,10 +35,10 @@ size_t Tensor::num_elem() {
 }
 
 void Tensor::reshape(const vector<int> &shape_) {
-  size_t n = 1;
+  // size_t n = 1;
   ndim = shape_.size(); // ndim<=5
   for (size_t i = 0; i < ndim; i++) {
     shape[i] = shape_[i];
-    n *= shape[i];
+    // n *= shape[i];
   }
 }
