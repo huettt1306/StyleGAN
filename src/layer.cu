@@ -93,25 +93,61 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   // Clear output buffer
   memset(output->buf, 0, N * K * OH * OW * sizeof(float));
 
-  #pragma omp parallel for collapse(2)
+  const int TILE_H = 32;  // Tile size for OH dimension
+  const int TILE_W = 64;  // Tile size for OW dimension
+
+  #pragma omp parallel for collapse(4)
   for (int n = 0; n < N; ++n) {
     for (int k = 0; k < K; ++k) {
-      for (int c = 0; c < C; ++c) {
-        for (int oh = 0; oh < OH; ++oh) {
-          for (int ow = 0; ow < OW; ++ow) {
-            float o = has_bias ? bias->buf[k] : 0;
-            int minr = max(0, (pad - oh * stride + dilation - 1) / dilation);
-            int maxr = min(R, (H + pad - oh * stride + dilation - 1) / dilation);
-            int mins = max(0, (pad - ow * stride + dilation - 1) / dilation);
-            int maxs = min(S, (W + pad - ow * stride + dilation - 1) / dilation);
-            for (int r = minr, h = oh * stride - pad + r * dilation; r < maxr; ++r, h += dilation) {
-              for (int s = mins, w = ow * stride - pad + s * dilation; s < maxs; ++s, w += dilation) {
-                float i = input->buf[n * C * H * W + c * H * W + h * W + w];
-                float f = weight->buf[k * C * R * S + c * R * S + r * S + s];
-                o += i * f;
+      for (int oh_tile = 0; oh_tile < OH; oh_tile += TILE_H) {
+        for (int ow_tile = 0; ow_tile < OW; ow_tile += TILE_W) {
+          int c;
+          for (c = 0; c + 3 < C; c += 4) {
+            int oh_end = min(oh_tile + TILE_H, OH);
+            int ow_end = min(ow_tile + TILE_W, OW);
+            
+            for (int oh = oh_tile; oh < oh_end; ++oh) {
+              for (int ow = ow_tile; ow < ow_end; ++ow) {
+                float o = has_bias ? bias->buf[k] : 0;
+                int minr = max(0, (pad - oh * stride + dilation - 1) / dilation);
+                int maxr = min(R, (H + pad - oh * stride + dilation - 1) / dilation);
+                int mins = max(0, (pad - ow * stride + dilation - 1) / dilation);
+                int maxs = min(S, (W + pad - ow * stride + dilation - 1) / dilation);
+
+                for (int r = minr, h = oh * stride - pad + r * dilation; r < maxr; ++r, h += dilation) {
+                  for (int s = mins, w = ow * stride - pad + s * dilation; s < maxs; ++s, w += dilation) {
+                    o += input->buf[n * C * H * W + c * H * W + h * W + w] * weight->buf[k * C * R * S + c * R * S + r * S + s];
+                    o += input->buf[n * C * H * W + (c + 1) * H * W + h * W + w] * weight->buf[k * C * R * S + (c + 1) * R * S + r * S + s];
+                    o += input->buf[n * C * H * W + (c + 2) * H * W + h * W + w] * weight->buf[k * C * R * S + (c + 2) * R * S + r * S + s];
+                    o += input->buf[n * C * H * W + (c + 3) * H * W + h * W + w] * weight->buf[k * C * R * S + (c + 3) * R * S + r * S + s];
+                  }
+                }
+                output->buf[n * K * OH * OW + k * OH * OW + oh * OW + ow] += o;
               }
             }
-            output->buf[n * K * OH * OW + k * OH * OW + oh * OW + ow] += o;
+          }
+          for (; c < C; ++c) {
+            int oh_end = min(oh_tile + TILE_H, OH);
+            int ow_end = min(ow_tile + TILE_W, OW);
+            
+            for (int oh = oh_tile; oh < oh_end; ++oh) {
+              for (int ow = ow_tile; ow < ow_end; ++ow) {
+                float o = has_bias ? bias->buf[k] : 0;
+                int minr = max(0, (pad - oh * stride + dilation - 1) / dilation);
+                int maxr = min(R, (H + pad - oh * stride + dilation - 1) / dilation);
+                int mins = max(0, (pad - ow * stride + dilation - 1) / dilation);
+                int maxs = min(S, (W + pad - ow * stride + dilation - 1) / dilation);
+                
+                for (int r = minr, h = oh * stride - pad + r * dilation; r < maxr; ++r, h += dilation) {
+                  for (int s = mins, w = ow * stride - pad + s * dilation; s < maxs; ++s, w += dilation) {
+                    float i = input->buf[n * C * H * W + c * H * W + h * W + w];
+                    float f = weight->buf[k * C * R * S + c * R * S + r * S + s];
+                    o += i * f;
+                  }
+                }
+                output->buf[n * K * OH * OW + k * OH * OW + oh * OW + ow] += o;
+              }
+            }
           }
         }
       }
@@ -137,25 +173,58 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
 
   memset(output->buf, 0, K * OH * OW * sizeof(float));
 
-  #pragma omp parallel for
+  const int TILE_H = 32;  
+  const int TILE_W = 64;  
+  
+  #pragma omp parallel for collapse(3)  
   for (int k = 0; k < K; ++k) {
-    for (int c = 0; c < C; ++c) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          float o = 0.0f;
-          int minr = max((oh + pad) % stride, oh + pad - H * stride + stride);
-          int maxr = min(oh + pad + 1, R);
-          int mins = max((ow + pad) % stride, ow + pad - W * stride + stride);
-          int maxs = min(ow + pad + 1, S);
+    for (int oh_tile = 0; oh_tile < OH; oh_tile += TILE_H) {
+      for (int ow_tile = 0; ow_tile < OW; ow_tile += TILE_W) {
+        int c = 0;
+        for (c = 0; c + 3 < C; c += 4) {
+          int oh_end = min(oh_tile + TILE_H, OH);
+          int ow_end = min(ow_tile + TILE_W, OW);
+          
+          for (int oh = oh_tile; oh < oh_end; ++oh) {
+            for (int ow = ow_tile; ow < ow_end; ++ow) {
+              float o = 0.0f;
+              int minr = max((oh + pad) % stride, oh + pad - H * stride + stride);
+              int maxr = min(oh + pad + 1, R);
+              int mins = max((ow + pad) % stride, ow + pad - W * stride + stride);
+              int maxs = min(ow + pad + 1, S);
 
-          for (int r = minr, h = (oh + pad - r) / stride; r < maxr; r += stride, h -= 1) {
-            for (int s = mins, w = (ow + pad - s) / stride; s < maxs; s += stride, w -= 1) {
-              float i = input->buf[c * H * W + h * W + w];
-              float f = weight->buf[c * K * R * S + k * R * S + r * S + s];
-              o += i * f;
+              for (int r = minr, h = (oh + pad - r) / stride; r < maxr; r += stride, h -= 1) {
+                for (int s = mins, w = (ow + pad - s) / stride; s < maxs; s += stride, w -= 1) {
+                  o += input->buf[c * H * W + h * W + w] * weight->buf[c * K * R * S + k * R * S + r * S + s];
+                  o += input->buf[(c+1) * H * W + h * W + w] * weight->buf[(c+1) * K * R * S + k * R * S + r * S + s];
+                  o += input->buf[(c+2) * H * W + h * W + w] * weight->buf[(c+2) * K * R * S + k * R * S + r * S + s];
+                  o += input->buf[(c+3) * H * W + h * W + w] * weight->buf[(c+3) * K * R * S + k * R * S + r * S + s];
+                }
+              }
+              output->buf[k * OH * OW + oh * OW + ow] += o;
             }
           }
-          output->buf[k * OH * OW + oh * OW + ow] += o;
+        }
+        for (; c < C; c++) {
+          int oh_end = min(oh_tile + TILE_H, OH);
+          int ow_end = min(ow_tile + TILE_W, OW);
+          
+          for (int oh = oh_tile; oh < oh_end; ++oh) {
+            for (int ow = ow_tile; ow < ow_end; ++ow) {
+              float o = 0.0f;
+              int minr = max((oh + pad) % stride, oh + pad - H * stride + stride);
+              int maxr = min(oh + pad + 1, R);
+              int mins = max((ow + pad) % stride, ow + pad - W * stride + stride);
+              int maxs = min(ow + pad + 1, S);
+
+              for (int r = minr, h = (oh + pad - r) / stride; r < maxr; r += stride, h -= 1) {
+                for (int s = mins, w = (ow + pad - s) / stride; s < maxs; s += stride, w -= 1) {
+                  o += input->buf[c * H * W + h * W + w] * weight->buf[c * K * R * S + k * R * S + r * S + s];
+                }
+              }
+              output->buf[k * OH * OW + oh * OW + ow] += o;
+            }
+          }
         }
       }
     }
