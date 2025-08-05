@@ -776,6 +776,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
 
       /* Copy the result (512x512 RGB image) to outputs */
       memcpy(outputs + n * 3 * 512 * 512, block6_to_rgb_output_a->buf, 3 * 512 * 512 * sizeof(float));
+      printTimeMap();
     }
   }
 }

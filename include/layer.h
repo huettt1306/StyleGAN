@@ -41,3 +41,5 @@ void StyledConv(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *m
 void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *output,
            Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *transpose_a, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a,
            bool demodulate, bool upsample, int padding);
+
+void printTimeMap();

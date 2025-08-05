@@ -1,5 +1,24 @@
 #include "layer.h"
 #include <omp.h>
+#include <chrono>
+#include <map>
+#include <cmath>
+#include <cstring>
+
+class Timer {
+private:
+  std::chrono::time_point<std::chrono::high_resolution_clock> start;
+public:
+  Timer() { start = std::chrono::high_resolution_clock::now(); }
+  double elapsed() {
+    auto end = std::chrono::high_resolution_clock::now();
+    std::chrono::duration<double> duration = end - start;
+    return duration.count();
+  }
+};
+
+static std::map<std::string, double> time_map;
+
 
 /*
   * PixelNorm
@@ -9,6 +28,7 @@
   */
 
 void PixelNorm(Tensor *inout) {
+  Timer timer;
   size_t C = inout->shape[1];
   
   float mean_squares = 0.f;
@@ -21,6 +41,8 @@ void PixelNorm(Tensor *inout) {
   for (size_t i = 0; i < C; i++) {
     inout->buf[i] *= norm_factor;
   }
+
+  time_map["PixelNorm"] += timer.elapsed();
 }
 
 /*
@@ -31,6 +53,7 @@ void PixelNorm(Tensor *inout) {
  *         OW = W * up + pad0 + pad1
  */
 void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
+  Timer timer;
   size_t N = input->shape[0];
   size_t C = input->shape[1]; 
   size_t H = input->shape[2];
@@ -48,6 +71,7 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
           }
       }
   }
+  time_map["UpsamplePad"] += timer.elapsed();
 }
 
 /*
@@ -61,6 +85,7 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
  */
 void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             int stride, int pad, int dilation, bool has_bias) {
+  Timer timer;
   int N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
   int K = weight->shape[0], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
@@ -88,6 +113,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
       }
     }
   }
+  time_map["Conv2d"] += timer.elapsed();
 }
 
 /*
@@ -100,6 +126,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
  */
 void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output, 
                      int stride, int pad) {
+  Timer timer;
   int C = input->shape[1], H = input->shape[2], W = input->shape[3];
   int K = weight->shape[1], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
@@ -127,6 +154,7 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
       }
     }
   }
+  time_map["ConvTranspose2d"] += timer.elapsed();
 }
 
 /* Transpose
@@ -135,6 +163,7 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
  * Transposes the first two dimensions of the input tensor.
  */
 void transpose(Tensor *input, Tensor *output) {
+  Timer timer;
   size_t N = input->shape[0];
   size_t C = input->shape[1];
   size_t H = input->shape[2];
@@ -151,6 +180,7 @@ void transpose(Tensor *input, Tensor *output) {
       }
     }
   }
+  time_map["transpose"] += timer.elapsed();
 }
 
 /* Linear
@@ -160,6 +190,8 @@ void transpose(Tensor *input, Tensor *output) {
  * @param [out] out: [M, N]
  */
 void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
+
+  Timer timer;
   size_t M = out->shape[0];
   size_t N = out->shape[1];
   size_t K = w->shape[1];
@@ -175,6 +207,7 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
       out->buf[m * N + n] += b->buf[n] * lr_mul;
     }
   }
+  time_map["Linear"] += timer.elapsed();
 }
 
 /* LeakyReLU
@@ -182,6 +215,7 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
  * 'N' is the number of elements in the tensor.
  */
 void LeakyReLU(Tensor *inout) {
+  Timer timer;
   size_t N = inout->num_elem();
 
   float negative_slope = 0.2f;
@@ -191,11 +225,13 @@ void LeakyReLU(Tensor *inout) {
     if (inout->buf[i] < 0) { inout->buf[i] *= negative_slope; }
     inout->buf[i] *= scale;
   }
+  time_map["LeakyReLU"] += timer.elapsed();
 }
 
 void upfir2d(Tensor *input, Tensor *kernel, Tensor *output,
                Tensor *upsample_a, Tensor *conv_a,
                int up, int pad0, int pad1) {
+  Timer timer;
   // Upsample and Pad -> Conv2d (FIR filter)
   UpsamplePad(input, upsample_a, up, pad0, pad1);
 
@@ -205,12 +241,15 @@ void upfir2d(Tensor *input, Tensor *kernel, Tensor *output,
   upsample_a->reshape({C, 1, H, W});
   Conv2d(upsample_a, kernel, nullptr, output, 1, 0, 1, false);
   upsample_a->reshape({1, C, H, W});
+
+  time_map["upfir2d"] += timer.elapsed();
 }
 
 void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *kernel, Tensor *output,
                      Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *transpose_a, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a,
                      bool demodulate, bool upsample, int padding, int up
 ) {
+  Timer timer;
   size_t in_C = input->shape[1];
   size_t out_C = conv_weight->shape[0];
   size_t kernel_size = conv_weight->shape[2];
@@ -258,6 +297,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   else {
     Conv2d(input, weight_a, nullptr, output, 1, padding, 1, false);
   }
+  time_map["ModulatedConv2d"] += timer.elapsed();
 }
 
 /* Add noise to the input tensor
@@ -267,6 +307,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
  */
 
 void addNoise(Tensor *inout, Tensor *noise) {
+  Timer timer;
   size_t C = inout->shape[1];
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
@@ -279,6 +320,7 @@ void addNoise(Tensor *inout, Tensor *noise) {
       }
     }
   }
+  time_map["addNoise"] += timer.elapsed();
 }
 
 /* Add bias to the input tensor
@@ -288,6 +330,7 @@ void addNoise(Tensor *inout, Tensor *noise) {
  */
 
 void addBias(Tensor *inout, Tensor *bias) {
+  Timer timer;
   size_t C = inout->shape[1];
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
@@ -300,6 +343,7 @@ void addBias(Tensor *inout, Tensor *bias) {
       }
     }
   }
+  time_map["addBias"] += timer.elapsed();
 }
 
 /*
@@ -309,27 +353,32 @@ void addBias(Tensor *inout, Tensor *bias) {
  * Adds the elements of addend to inout in-place.
  */
 void elemAdd(Tensor *inout, Tensor *addend) {
+  Timer timer;
   size_t N = inout->num_elem();
 
   for (size_t i = 0; i < N; i++) {
     inout->buf[i] += addend->buf[i];
   }
+  time_map["elemAdd"] += timer.elapsed();
 }
 
 void StyledConv(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *noise, Tensor *output,
                 Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *transpose_a, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a,
                 bool demodulate, bool upsample, int padding) {
+  Timer timer;
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, demod_a, transpose_a, conv_a, upsample_a, conv2_a,
                   demodulate, upsample, padding, 1);
   addNoise(output, noise);
   addBias(output, conv_bias);
   LeakyReLU(output);
+  time_map["StyledConv"] += timer.elapsed();
 }
 
 void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *conv_bias, Tensor *kernel, Tensor *output,
            Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *transpose_a, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a, Tensor *skip_upsample_a, Tensor *skip_conv_a, Tensor *skip_a,
            bool demodulate, bool upsample, int padding) {
+  Timer timer;
   ModulatedConv2d(input, style, modulate_weight, modulate_bias, conv_weight, kernel, output,
                   style_a, weight_a, demod_a, transpose_a, conv_a, upsample_a, conv2_a,
                   demodulate, upsample, padding, 2);
@@ -339,4 +388,13 @@ void ToRGB(Tensor *input, Tensor *skip, Tensor *style, Tensor *modulate_weight, 
     upfir2d(skip, kernel, skip_a, skip_upsample_a, skip_conv_a, 2, 2, 1);
     elemAdd(output, skip_a);
   }
+  time_map["ToRGB"] += timer.elapsed();
+}
+
+void printTimeMap() {
+  printf("\n-------------------------------------\n");
+  for (const auto &entry : time_map) {
+    printf("%s: %.6f seconds\n", entry.first.c_str(), entry.second);
+  }
+  time_map.clear();
 }
