@@ -13,14 +13,15 @@ Tensor::Tensor(const vector<size_t> &shape_) {
   ndim = shape_.size();
   for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
   size_t N_ = num_elem();
-  buf = (float *) calloc(N_, sizeof(float));
+  buf = (float*) aligned_alloc(32, N_ * sizeof(float)); 
+  memset(buf, 0, N_ * sizeof(float));
 }
 
 Tensor::Tensor(const vector<size_t> &shape_, float *buf_) {
   ndim = shape_.size();
   for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
   size_t N_ = num_elem();
-  buf = (float *) malloc(N_ * sizeof(float));
+  buf = (float*) aligned_alloc(32, N_ * sizeof(float)); 
   memcpy(buf, buf_, N_ * sizeof(float));
 }
 
