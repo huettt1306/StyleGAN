@@ -106,7 +106,6 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
  */
 void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
   Timer timer;
-  memset(C, 0, M * N * sizeof(float));
   #pragma omp parallel num_threads(32)
   {
     int tid = omp_get_thread_num();
@@ -114,6 +113,11 @@ void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
     CPU_ZERO(&cpuset);
     CPU_SET(tid, &cpuset);
     sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+    #pragma omp for simd
+    for (int i = 0; i < M * N; i++) {
+      C[i] = 0.0f;
+    }
 
     #pragma omp for collapse(2)
     for (int i = 0; i < M; i += ITILESIZE) {
@@ -271,15 +275,28 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 
   im2col_nchw(input, A, Kc, stride, pad, dilation, R, S, N, C, H, W, OH, OW);
 
-  memset(B, 0, Kc * Nc * sizeof(float));
-  #pragma omp parallel for collapse(2)
-  for (int k = 0; k < K; ++k) {
-    for (int c = 0; c < C; ++c) {
-      for (int r = 0; r < R; ++r) {
-        for (int s_ = 0; s_ < S; ++s_) {
-          size_t row = (size_t)c * R * S + r * S + s_;
-          B[row * Nc + k] =
-            weight->buf[(size_t)k * C * R * S + (size_t)c * R * S + r * S + s_];
+  #pragma omp parallel num_threads(32)
+  {
+    int tid = omp_get_thread_num();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(tid, &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+    #pragma omp for simd
+    for (size_t i = 0; i < Kc * Nc; i++) {
+      B[i] = 0.0f;
+    }
+
+    #pragma omp for collapse(2)
+    for (int k = 0; k < K; ++k) {
+      for (int c = 0; c < C; ++c) {
+        for (int r = 0; r < R; ++r) {
+          for (int s_ = 0; s_ < S; ++s_) {
+            size_t row = (size_t)c * R * S + r * S + s_;
+            B[row * Nc + k] =
+              weight->buf[(size_t)k * C * R * S + (size_t)c * R * S + r * S + s_];
+          }
         }
       }
     }
@@ -301,7 +318,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
     }
   }
 
-  free(A); free(B); free(Cmat);
+  // free(A); free(B); free(Cmat);
   time_map["Conv2d"] += timer.elapsed();
 }
 
@@ -334,15 +351,28 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
 
   im2col_tconv_nchw(input, A, Kc, stride, pad, R, S, N, C, H, W, OH, OW);
 
-  memset(B, 0, Kc * Nc * sizeof(float));
-  #pragma omp parallel for collapse(2)
-  for (int k = 0; k < K; ++k) {
-    for (int c = 0; c < C; ++c) {
-      for (int r = 0; r < R; ++r) {
-        for (int s_ = 0; s_ < S; ++s_) {
-          size_t row = (size_t)c * R * S + r * S + s_;
-          B[row * Nc + k] =
-            weight->buf[((size_t)c * K + k) * R * S + (size_t)r * S + s_];
+  #pragma omp parallel num_threads(32)
+  {
+    int tid = omp_get_thread_num();
+    cpu_set_t cpuset;
+    CPU_ZERO(&cpuset);
+    CPU_SET(tid, &cpuset);
+    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+
+    #pragma omp for simd
+    for (size_t i = 0; i < Kc * Nc; i++) {
+      B[i] = 0.0f;
+    }
+
+    #pragma omp for collapse(2)
+    for (int k = 0; k < K; ++k) {
+      for (int c = 0; c < C; ++c) {
+        for (int r = 0; r < R; ++r) {
+          for (int s_ = 0; s_ < S; ++s_) {
+            size_t row = (size_t)c * R * S + r * S + s_;
+            B[row * Nc + k] =
+              weight->buf[((size_t)c * K + k) * R * S + (size_t)r * S + s_];
+          }
         }
       }
     }
