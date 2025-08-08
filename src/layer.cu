@@ -74,6 +74,21 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
   time_map["UpsamplePad"] += timer.elapsed();
 }
 
+void mat_mul(float *a, float *b, float *c, size_t M, size_t N, size_t K) {
+  Timer timer;
+  #pragma omp parallel for collapse(2)
+  for (size_t m = 0; m < M; m++) {
+    for (size_t n = 0; n < N; n++) {
+      float sum = 0.0f;
+      for (size_t k = 0; k < K; k++) {
+        sum += a[m * K + k] * b[k * N + n];
+      }
+      c[m * N + n] = sum;
+    }
+  }
+  time_map["mat_mul"] += timer.elapsed();
+}
+
 /*
  * Convolution
  * input shape = (N, C, H, W)
@@ -83,6 +98,85 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
  *   where OH = (H + 2 * pad - dilation * (R - 1) - 1) / stride + 1,
  *         OW = (W + 2 * pad - dilation * (S - 1) - 1) / stride + 1
  */
+static inline size_t round_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
+
+// Convert NCHW input into (N*OH*OW) x (C*R*S_padded) matrix
+static void im2col_nchw(const Tensor *input,
+                        float *A, size_t Kc,
+                        int stride, int pad, int dilation,
+                        int R, int S,
+                        int N, int C, int H, int W, int OH, int OW) {
+  Timer timer;
+  // A shape: M x Kc where M = N*OH*OW
+  #pragma omp parallel for collapse(3)
+  for (int n = 0; n < N; ++n) {
+    for (int oh = 0; oh < OH; ++oh) {
+      for (int ow = 0; ow < OW; ++ow) {
+        size_t m = ((size_t)n * OH + oh) * OW + ow;
+        float *prow = A + m * Kc;
+        memset(prow, 0, Kc * sizeof(float));
+
+        for (int c = 0; c < C; ++c) {
+          for (int r = 0; r < R; ++r) {
+            int h = oh * stride - pad + r * dilation;
+            if (h < 0 || h >= H) continue;
+
+            for (int s = 0; s < S; ++s) {
+              int w = ow * stride - pad + s * dilation;
+              size_t col = (size_t)c * R * S + r * S + s;
+
+              if (w < 0 || w >= W) continue;
+
+              prow[col] = input->buf[((size_t)n * C + c) * H * W + (size_t)h * W + w];
+            }
+          }
+        }
+      }
+    }
+  }
+  time_map["im2col_nchw"] += timer.elapsed();
+}
+
+// Convert NCHW input into (N*OH*OW) x (C*R*S_padded) matrix for transposed conv
+static void im2col_tconv_nchw(const Tensor *input,
+                              float *A, size_t Kc,
+                              int stride, int pad,
+                              int R, int S,
+                              int N, int C, int H, int W, int OH, int OW) {
+  Timer timer;
+  // A shape: M x Kc where M = N*OH*OW
+  #pragma omp parallel for collapse(3)
+  for (int n = 0; n < N; ++n) {
+    for (int oh = 0; oh < OH; ++oh) {
+      for (int ow = 0; ow < OW; ++ow) {
+        size_t m = ((size_t)n * OH + oh) * OW + ow;
+        float *prow = A + m * Kc;
+        memset(prow, 0, Kc * sizeof(float));
+
+        for (int c = 0; c < C; ++c) {
+          for (int r = 0; r < R; ++r) {
+            int t_h = oh + pad - r;
+            if (t_h % stride != 0) continue;
+            int h = t_h / stride;
+            if (h < 0 || h >= H) continue;
+
+            for (int s = 0; s < S; ++s) {
+              int t_w = ow + pad - s;
+              if (t_w % stride != 0) continue;
+              int w = t_w / stride;
+              if (w < 0 || w >= W) continue;
+
+              size_t col = (size_t)c * R * S + r * S + s;
+              prow[col] = input->buf[((size_t)n * C + c) * H * W + (size_t)h * W + w];
+            }
+          }
+        }
+      }
+    }
+  }
+  time_map["im2col_tconv_nchw"] += timer.elapsed();
+}
+
 void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             int stride, int pad, int dilation, bool has_bias) {
   Timer timer;
@@ -90,29 +184,56 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   int K = weight->shape[0], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
-  #pragma omp parallel for collapse(4)
-  for (int n = 0; n < N; ++n) {
-    for (int k = 0; k < K; ++k) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          float o = has_bias ? bias->buf[k] : 0;
-          for (int c = 0; c < C; ++c) {
-            for (int r = 0; r < R; ++r) {
-              for (int s = 0; s < S; ++s) {
-                int h = oh * stride - pad + r * dilation;
-                int w = ow * stride - pad + s * dilation;
-                if (h < 0 || h >= H || w < 0 || w >= W) continue;
-                float i = input->buf[n * C * H * W + c * H * W + h * W + w];
-                float f = weight->buf[k * C * R * S + c * R * S + r * S + s];
-                o += i * f;
-              }
-            }
-          }
-          output->buf[n * K * OH * OW + k * OH * OW + oh * OW + ow] = o;
+  // Dimensions for GEMM: (M x Kc) * (Kc x Nout) = (M x Nout)
+  size_t M = (size_t)N * OH * OW;           
+  size_t K0 = (size_t)C * R * S;           
+  size_t Kc = round_up(K0, 8);             
+  size_t Nout = (size_t)K;                 
+
+  // Allocate buffers
+  float *A = new float[M * Kc];            
+  float *B = new float[Kc * Nout];         
+  float *Cmat = new float[M * Nout];       
+
+  // Build im2col matrix A
+  im2col_nchw(input, A, Kc, stride, pad, dilation, R, S, N, C, H, W, OH, OW);
+
+  // Build B by transposing weights to (C*R*S) x K and padding rows
+  memset(B, 0, Kc * Nout * sizeof(float));
+  #pragma omp parallel for collapse(2)
+  for (int k = 0; k < K; ++k) {
+    for (int c = 0; c < C; ++c) {
+      for (int r = 0; r < R; ++r) {
+        for (int s_ = 0; s_ < S; ++s_) {
+          size_t row = (size_t)c * R * S + r * S + s_;
+          B[row * Nout + k] = weight->buf[(size_t)k * C * R * S + (size_t)c * R * S + r * S + s_];
         }
       }
     }
   }
+
+  // GEMM: (M x Kc) * (Kc x K) -> (M x K)
+  mat_mul(A, B, Cmat, M, Nout, Kc);
+
+  // Write back to output tensor [N, K, OH, OW] and add bias if needed
+  #pragma omp parallel for collapse(3)
+  for (int n = 0; n < N; ++n) {
+    for (int oh = 0; oh < OH; ++oh) {
+      for (int ow = 0; ow < OW; ++ow) {
+        size_t m = ((size_t)n * OH + oh) * OW + ow;
+        for (int k = 0; k < K; ++k) {
+          float v = Cmat[m * Nout + k];
+          if (has_bias) v += bias->buf[k];
+          output->buf[((size_t)n * K + k) * OH * OW + (size_t)oh * OW + ow] = v;
+        }
+      }
+    }
+  }
+
+  delete[] A;
+  delete[] B;
+  delete[] Cmat;
+
   time_map["Conv2d"] += timer.elapsed();
 }
 
@@ -127,33 +248,60 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output, 
                      int stride, int pad) {
   Timer timer;
+  int N = input->shape[0];
   int C = input->shape[1], H = input->shape[2], W = input->shape[3];
   int K = weight->shape[1], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
-  #pragma omp parallel for collapse(3)
+  // GEMM dims: (M x Kc) * (Kc x K) = (M x K)
+  size_t M   = (size_t)N * OH * OW;      
+  size_t K0  = (size_t)C * R * S;        
+  size_t Kc  = round_up(K0, 8);          
+  size_t Nout = (size_t)K;               
+
+  float *A    = new float[M * Kc];       
+  float *B    = new float[Kc * Nout];    
+  float *Cmat = new float[M * Nout];     
+
+  // Build A from input using transposed-conv im2col
+  im2col_tconv_nchw(input, A, Kc, stride, pad, R, S, N, C, H, W, OH, OW);
+
+  // Build B by flattening weights (C, K, R, S) -> (C*R*S, K), with padding
+  memset(B, 0, Kc * Nout * sizeof(float));
+  #pragma omp parallel for collapse(2)
   for (int k = 0; k < K; ++k) {
-    for (int oh = 0; oh < OH; ++oh) {
-      for (int ow = 0; ow < OW; ++ow) {
-        float o = 0.0f;
-        for (int c = 0; c < C; ++c) {
-          for (int r = 0; r < R; ++r) {
-            for (int s = 0; s < S; ++s) {
-              if ((oh + pad - r) % stride != 0) continue;
-              if ((ow + pad - s) % stride != 0) continue;
-              int h = (oh + pad - r) / stride;
-              int w = (ow + pad - s) / stride;
-              if (h < 0 || h >= H || w < 0 || w >= W) continue;
-              float i = input->buf[c * H * W + h * W + w];
-              float f = weight->buf[c * K * R * S + k * R * S + r * S + s];
-              o += i * f;
-            }
-          }
+    for (int c = 0; c < C; ++c) {
+      for (int r = 0; r < R; ++r) {
+        for (int s_ = 0; s_ < S; ++s_) {
+          size_t row = (size_t)c * R * S + r * S + s_;
+          B[row * Nout + k] =
+              weight->buf[((size_t)c * K + k) * R * S + (size_t)r * S + s_];
         }
-        output->buf[k * OH * OW + oh * OW + ow] = o;
       }
     }
   }
+
+  // GEMM
+  mat_mul(A, B, Cmat, M, Nout, Kc);
+
+  // Write back to output tensor [N, K, OH, OW]
+  #pragma omp parallel for collapse(3)
+  for (int n = 0; n < N; ++n) {
+    for (int oh = 0; oh < OH; ++oh) {
+      for (int ow = 0; ow < OW; ++ow) {
+        size_t m = ((size_t)n * OH + oh) * OW + ow;
+        for (int k = 0; k < K; ++k) {
+          output->buf[((size_t)n * K + k) * OH * OW + (size_t)oh * OW + ow] =
+              Cmat[m * Nout + k];
+        }
+      }
+    }
+  }
+
+  delete[] A;
+  delete[] B;
+  delete[] Cmat;
+
   time_map["ConvTranspose2d"] += timer.elapsed();
 }
 
