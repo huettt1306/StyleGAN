@@ -22,7 +22,7 @@ public:
 static std::map<std::string, double> time_map;
 #define ITILESIZE (32)
 #define JTILESIZE (256)
-#define KTILESIZE (64)
+#define KTILESIZE (128)
 
 /*
   * PixelNorm
@@ -42,6 +42,7 @@ void PixelNorm(Tensor *inout) {
   mean_squares /= C;
   float norm_factor = rsqrtf(mean_squares + 1e-8f);
 
+  #pragma omp parallel for simd
   for (size_t i = 0; i < C; i++) {
     inout->buf[i] *= norm_factor;
   }
@@ -67,6 +68,8 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
   size_t OW = up * W + pad0 + pad1;
 
   memset(output->buf, 0, N * C * OH * OW * sizeof(float));
+
+  #pragma omp parallel for collapse(2)
   for (size_t c = 0; c < C; ++c) {
     for (size_t h = 0; h < H; ++h) {
       for (size_t w = 0; w < W; ++w) {
@@ -84,62 +87,86 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
  */
 void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
   Timer timer;
+      
   #pragma omp parallel num_threads(32)
   {
-    int tid = omp_get_thread_num();
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(tid, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+  int tid = omp_get_thread_num();
+  cpu_set_t cpuset;
+  CPU_ZERO(&cpuset);
+  CPU_SET(tid, &cpuset);
+  sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
 
-    #pragma omp for simd
-    for (int i = 0; i < M * N; i++) {
-      C[i] = 0.0f;
-    }
+  #pragma omp for simd
+  for (int i = 0; i < M * N; i++) {
+    C[i] = 0.0f;
+  }
 
-    #pragma omp for collapse(2)
-    for (int i = 0; i < M; i += ITILESIZE) {
-      for (int j = 0; j < N; j += JTILESIZE) {
-        for (int k = 0; k < K; k += KTILESIZE) {
-          for (int kk = k; kk < K && kk < k + KTILESIZE; kk += 8) {
-            for (int ii = i; ii < M && ii < i + ITILESIZE; ii++) {
-              __m256 a0 = _mm256_set1_ps(A[ii*K + (kk+0)]);
-              __m256 a1 = _mm256_set1_ps(A[ii*K + (kk+1)]);
-              __m256 a2 = _mm256_set1_ps(A[ii*K + (kk+2)]);
-              __m256 a3 = _mm256_set1_ps(A[ii*K + (kk+3)]);
-              __m256 a4 = _mm256_set1_ps(A[ii*K + (kk+4)]);
-              __m256 a5 = _mm256_set1_ps(A[ii*K + (kk+5)]);
-              __m256 a6 = _mm256_set1_ps(A[ii*K + (kk+6)]);
-              __m256 a7 = _mm256_set1_ps(A[ii*K + (kk+7)]);
+  #pragma omp for collapse(2)
+  for (int i = 0; i < M; i += ITILESIZE) {
+    for (int j = 0; j < N; j += JTILESIZE) {
+      for (int k = 0; k < K; k += KTILESIZE) {
+        for (int kk = k; kk < K && kk < k + KTILESIZE; kk+=8) {
+          for (int ii = i;ii < M && ii < i + ITILESIZE; ii++) {
+            __m256 a0 = _mm256_set1_ps(A[(ii+0)*K+(kk+0)]);
+            __m256 a1 = _mm256_set1_ps(A[(ii+0)*K+(kk+1)]);
+            __m256 a2 = _mm256_set1_ps(A[(ii+0)*K+(kk+2)]);
+            __m256 a3 = _mm256_set1_ps(A[(ii+0)*K+(kk+3)]);
+            __m256 a4 = _mm256_set1_ps(A[(ii+0)*K+(kk+4)]);
+            __m256 a5 = _mm256_set1_ps(A[(ii+0)*K+(kk+5)]);
+            __m256 a6 = _mm256_set1_ps(A[(ii+0)*K+(kk+6)]);
+            __m256 a7 = _mm256_set1_ps(A[(ii+0)*K+(kk+7)]);
 
-              for (int jj = j; jj < N && jj < j + JTILESIZE; jj += 8) {
-                __m256 c0 = _mm256_load_ps(&C[ii * N + jj]);
+            for (int jj = j; jj < N && jj < j + JTILESIZE; jj+=16) {
+              __m256 c0 = _mm256_load_ps(&C[(ii+0) * N + jj]);
 
-                __m256 b0 = _mm256_load_ps(&B[(kk+0) * N + jj]);
-                __m256 b1 = _mm256_load_ps(&B[(kk+1) * N + jj]);
-                __m256 b2 = _mm256_load_ps(&B[(kk+2) * N + jj]);
-                __m256 b3 = _mm256_load_ps(&B[(kk+3) * N + jj]);
-                __m256 b4 = _mm256_load_ps(&B[(kk+4) * N + jj]);
-                __m256 b5 = _mm256_load_ps(&B[(kk+5) * N + jj]);
-                __m256 b6 = _mm256_load_ps(&B[(kk+6) * N + jj]);
-                __m256 b7 = _mm256_load_ps(&B[(kk+7) * N + jj]);
 
-                c0 = _mm256_fmadd_ps(a0, b0, c0);
-                c0 = _mm256_fmadd_ps(a1, b1, c0);
-                c0 = _mm256_fmadd_ps(a2, b2, c0);
-                c0 = _mm256_fmadd_ps(a3, b3, c0);
-                c0 = _mm256_fmadd_ps(a4, b4, c0);
-                c0 = _mm256_fmadd_ps(a5, b5, c0);
-                c0 = _mm256_fmadd_ps(a6, b6, c0);
-                c0 = _mm256_fmadd_ps(a7, b7, c0);
+              __m256 b0 = _mm256_load_ps(&B[(kk+0) * N + jj]);
+              __m256 b1 = _mm256_load_ps(&B[(kk+1) * N + jj]);
+              __m256 b2 = _mm256_load_ps(&B[(kk+2) * N + jj]);
+              __m256 b3 = _mm256_load_ps(&B[(kk+3) * N + jj]);
+              __m256 b4 = _mm256_load_ps(&B[(kk+4) * N + jj]);
+              __m256 b5 = _mm256_load_ps(&B[(kk+5) * N + jj]);
+              __m256 b6 = _mm256_load_ps(&B[(kk+6) * N + jj]);
+              __m256 b7 = _mm256_load_ps(&B[(kk+7) * N + jj]);
 
-                _mm256_store_ps(&C[ii * N + jj], c0);
-              }
+              c0 = _mm256_fmadd_ps(a0, b0, c0);
+              c0 = _mm256_fmadd_ps(a1, b1, c0);
+              c0 = _mm256_fmadd_ps(a2, b2, c0);
+              c0 = _mm256_fmadd_ps(a3, b3, c0);
+              c0 = _mm256_fmadd_ps(a4, b4, c0);
+              c0 = _mm256_fmadd_ps(a5, b5, c0);
+              c0 = _mm256_fmadd_ps(a6, b6, c0);
+              c0 = _mm256_fmadd_ps(a7, b7, c0);
+
+              __m256 d0 = _mm256_load_ps(&C[(ii+0) * N + jj+8]);
+
+              __m256 e0 = _mm256_load_ps(&B[(kk+0) * N + jj+8]);
+              __m256 e1 = _mm256_load_ps(&B[(kk+1) * N + jj+8]);
+              __m256 e2 = _mm256_load_ps(&B[(kk+2) * N + jj+8]);
+              __m256 e3 = _mm256_load_ps(&B[(kk+3) * N + jj+8]);
+              __m256 e4 = _mm256_load_ps(&B[(kk+4) * N + jj+8]);
+              __m256 e5 = _mm256_load_ps(&B[(kk+5) * N + jj+8]);
+              __m256 e6 = _mm256_load_ps(&B[(kk+6) * N + jj+8]);
+              __m256 e7 = _mm256_load_ps(&B[(kk+7) * N + jj+8]);
+
+              d0 = _mm256_fmadd_ps(a0, e0, d0);
+              d0 = _mm256_fmadd_ps(a1, e1, d0);
+              d0 = _mm256_fmadd_ps(a2, e2, d0);
+              d0 = _mm256_fmadd_ps(a3, e3, d0);
+              d0 = _mm256_fmadd_ps(a4, e4, d0);
+              d0 = _mm256_fmadd_ps(a5, e5, d0);
+              d0 = _mm256_fmadd_ps(a6, e6, d0);
+              d0 = _mm256_fmadd_ps(a7, e7, d0);
+
+              _mm256_store_ps(&C[(ii+0)*N+jj], c0);
+              _mm256_store_ps(&C[(ii+0)*N+jj+8], d0);
             }
           }
         }
       }
     }
+  }
+
   }
 
   time_map["matmul"] += timer.elapsed();
@@ -157,85 +184,34 @@ void im2col (const Tensor *img, float *col, int N, int C, int H, int W, int OH, 
              int R, int S, int stride, int pad, int dilation) {
   Timer timer;
 
+  const int img_stride_c = H * W;
+  const int num_patches = OH * OW;
+
   #pragma omp parallel for collapse(4)
-  for (int n = 0; n < N; ++n) {
-    for (int c = 0; c < C; ++c) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          int h_start = oh * stride - pad;
-          int w_start = ow * stride - pad;
-          int h_end = h_start + dilation * (R - 1) + 1;
-          int w_end = w_start + dilation * (S - 1) + 1;
+  for (int n = 0; n < N; n++) {
+    for (int c = 0; c < C; c++) {
+      for (int r = 0; r < R; r++) {
+        for (int s = 0; s < S; s++) {
+          int k = c * R * S + r * S + s;
+          int h_start = r * dilation - pad;
+          int w_start = s * dilation - pad;
 
-          for (int r = 0; r < R; ++r) {
-            for (int s = 0; s < S; ++s) {
-              int h = h_start + r * dilation;
-              int w = w_start + s * dilation;
-
+          for (int oh = 0, h = h_start; oh < OH; ++oh, h += stride) {
+            for (int ow = 0, w = w_start; ow < OW; ++ow, w += stride) {
+              float val = 0.0f;
               if (h >= 0 && h < H && w >= 0 && w < W) {
-                col[((c * R + r) * S + s) * N * OH * OW + n * OH * OW + oh * OW + ow] =
-                    img->buf[n * C * H * W + c * H * W + h * W + w];
-              } else {
-                col[((c * R + r) * S + s) * N * OH * OW + n * OH * OW + oh * OW + ow] = 0.0f;
+                val = img->buf[n * C * H * W + c * img_stride_c + h * W + w];
               }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  int padded_CRS = round_up(C * R * S, 8);
-  #pragma omp parallel for collapse(2)
-  for (int i = C * R * S; i < padded_CRS; ++i) {
-    for (int j = 0; j < N * OH * OW; ++j) {
-      col[i * N * OH * OW + j] = 0.0f;
-    }
-  }
-
-  time_map["im2col"] += timer.elapsed();
-}
-
-/*
- * im2col for transposed convolution
- * For transposed conv, we need to map each output position to input positions
- * image shape = (N, C, H, W)
- * col shape = (round_up(C x R x S, 8), round_up(OH x OW, 8))
- */
-void im2col_tconv(const Tensor *img, float *col, int N, int C, int H, int W, int OH, int OW,
-                  int R, int S, int stride, int pad, int dilation) {
-  Timer timer;
-
-  int padded_CRS = round_up(C * R * S, 8);
-  int padded_OHOW = round_up(OH * OW, 8);
-  memset(col, 0, padded_CRS * padded_OHOW * sizeof(float));
-
-  #pragma omp parallel for collapse(4)
-  for (int n = 0; n < N; ++n) {
-    for (int c = 0; c < C; ++c) {
-      for (int h = 0; h < H; ++h) {
-        for (int w = 0; w < W; ++w) {
-          float input_val = img->buf[n * C * H * W + c * H * W + h * W + w];
-          
-          for (int r = 0; r < R; ++r) {
-            for (int s = 0; s < S; ++s) {
-              int oh = h * stride - pad + r;
-              int ow = w * stride - pad + s;
               
-              if (oh >= 0 && oh < OH && ow >= 0 && ow < OW) {
-                int crs_idx = (c * R + r) * S + s;
-                int spatial_idx = oh * OW + ow; 
-                int col_idx = crs_idx * padded_OHOW + spatial_idx;
-                col[col_idx] = input_val;
-              }
+              col[k * N * num_patches + n * num_patches + oh * OW + ow] = val;
             }
           }
         }
       }
     }
   }
-
-  time_map["im2col_tconv"] += timer.elapsed();
+  
+  time_map["im2col"] += timer.elapsed();
 }
 
 /*
@@ -249,14 +225,13 @@ void addPadding(float *A, float *B, int K, int C, int R, int S) {
   int N_ = round_up(C * R * S, 8);
   int N = C * R * S;
 
-  #pragma omp parallel for collapse(2)
+  #pragma omp parallel for
   for (int i = 0; i < K; ++i) {
-    for (int j = 0; j < N_; ++j) {
-      if (i < K && j < N) {
-        B[i * N_ + j] = A[i * N + j];
-      } else {
-        B[i * N_ + j] = 0.0f;
-      }
+    float *dst = B + (size_t)i * N_;
+    const float *src = A + (size_t)i * N;
+    memcpy(dst, src, N * sizeof(float));
+    if (N_ > N) {
+      memset(dst + N, 0, (N_ - N) * sizeof(float));
     }
   }
 
@@ -292,11 +267,11 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   mat_mul(wei, col, output->buf, _M, _N, _K);
 
   if (has_bias) {
-    #pragma omp parallel for
-    for (int k = 0; k < K; ++k) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          output->buf[k * OH * OW + oh * OW + ow] += bias->buf[k];
+    #pragma omp parallel for simd
+    for (int oh = 0; oh < OH; ++oh) {
+      for (int ow = 0; ow < OW; ++ow) {
+        for (int k = 0; k < K; ++k) {
+          output->buf[(size_t)k * OH * OW + (size_t)oh * OW + ow] += bias->buf[k];
         }
       }
     }
@@ -395,6 +370,7 @@ void transpose(Tensor *input, Tensor *output) {
   size_t H = input->shape[2];
   size_t W = input->shape[3];
 
+  #pragma omp parallel for simd collapse(2)
   for (size_t n = 0; n < N; n++) {
     for (size_t c = 0; c < C; c++) {
       for (size_t h = 0; h < H; h++) {
@@ -424,6 +400,7 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
 
   float scale = (1.0f / sqrtf(K)) * lr_mul;
 
+  #pragma omp parallel for 
   for (size_t m = 0; m < M; m++) {
     for (size_t n = 0; n < N; n++) {
       out->buf[m * N + n] = 0;
@@ -447,6 +424,7 @@ void LeakyReLU(Tensor *inout) {
   float negative_slope = 0.2f;
   float scale = sqrtf(2.0f);
 
+  #pragma omp parallel for simd
   for (size_t i = 0; i < N; i++) {
     if (inout->buf[i] < 0) { inout->buf[i] *= negative_slope; }
     inout->buf[i] *= scale;
@@ -484,6 +462,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
 
   float scale = 1 / sqrtf((float) (in_C * kernel_size * kernel_size));
 
+  #pragma omp parallel for 
   for (size_t oc = 0; oc < out_C; oc++) {
     for (size_t ic = 0; ic < in_C; ic++) {
       for (size_t k = 0; k < kernel_size * kernel_size; k++) {
@@ -494,6 +473,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   }
 
   if (demodulate) {
+    #pragma omp parallel for
     for (size_t oc = 0; oc < out_C; oc++) {
       float sum = 0.0f;
       for (size_t ic = 0; ic < in_C; ic++) {
@@ -505,6 +485,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
       demod_a->buf[oc] = 1.0f / sqrtf(sum + 1e-8f);
     }
 
+    #pragma omp parallel for
     for (size_t oc = 0; oc < out_C; oc++) {
       for (size_t ic = 0; ic < in_C; ic++) {
         for (size_t k = 0; k < kernel_size * kernel_size; k++) {
@@ -538,6 +519,7 @@ void addNoise(Tensor *inout, Tensor *noise) {
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
 
+  #pragma omp parallel for simd collapse(2)
   for (size_t c = 0; c < C; c++) {
     for (size_t h = 0; h < H; h++) {
       for (size_t w = 0; w < W; w++) {
@@ -561,6 +543,7 @@ void addBias(Tensor *inout, Tensor *bias) {
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
 
+  #pragma omp parallel for simd collapse(2) 
   for (size_t c = 0; c < C; c++) {
     for (size_t h = 0; h < H; h++) {
       for (size_t w = 0; w < W; w++) {
@@ -582,6 +565,7 @@ void elemAdd(Tensor *inout, Tensor *addend) {
   Timer timer;
   size_t N = inout->num_elem();
 
+  #pragma omp parallel for simd
   for (size_t i = 0; i < N; i++) {
     inout->buf[i] += addend->buf[i];
   }
