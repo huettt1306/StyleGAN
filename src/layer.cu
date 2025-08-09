@@ -84,7 +84,6 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
  */
 void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
   Timer timer;
-  // printf("Matrix multiplication: %d x %d x %d\n", M, N, K);
   #pragma omp parallel num_threads(32)
   {
     int tid = omp_get_thread_num();
@@ -242,15 +241,18 @@ void im2col_tconv(const Tensor *img, float *col, int N, int C, int H, int W, int
 /*
  * Add padding to weight matrix
  * A: weight matrix (K, CRS) = (M, N)
- * B: padded weight matrix (round_up(K, 8), round_up(CRS, 8)) = (M_, N_)
+ * B: padded weight matrix (K, round_up(CRS, 8)) = (M_, N_)
 */
-void addPadding(float *A, float *B, int M, int N, int M_, int N_) {
+void addPadding(float *A, float *B, int K, int C, int R, int S) {
   Timer timer;
 
+  int N_ = round_up(C * R * S, 8);
+  int N = C * R * S;
+
   #pragma omp parallel for collapse(2)
-  for (int i = 0; i < M_; ++i) {
+  for (int i = 0; i < K; ++i) {
     for (int j = 0; j < N_; ++j) {
-      if (i < M && j < N) {
+      if (i < K && j < N) {
         B[i * N_ + j] = A[i * N + j];
       } else {
         B[i * N_ + j] = 0.0f;
@@ -259,40 +261,6 @@ void addPadding(float *A, float *B, int M, int N, int M_, int N_) {
   }
 
   time_map["addPadding"] += timer.elapsed();
-}
-
-/*
- * Add padding and transpose
- * A: weight matrix (CKRS)
- * B: padded and transposed weight matrix (K, round_up(C * R * S, 8))
-*/
-void addPaddingTranspose(float *A, float *B, int K, int C, int R, int S) {
-  Timer timer;
-
-  int M = K;
-  int CRS = round_up(C * R * S, 8);
-
-  #pragma omp parallel for collapse(2)
-  for (int c = 0; c < C; ++c) {
-    for (int k = 0; k < K; ++k) {
-      for (int r = 0; r < R; ++r) {
-        for (int s = 0; s < S; ++s) {
-          int idx_A = ((c * K + k) * R + r) * S + s;
-          int idx_B = k * CRS + c * R * S + r * S + s;
-          B[idx_B] = A[idx_A];
-        }
-      }
-    }
-  }
-
-  #pragma omp parallel for
-  for (int i = C * R * S; i < CRS; ++i) {
-    for (int j = 0; j < K; ++j) {
-      B[j * CRS + i] = 0.0f;
-    }
-  }
-
-  time_map["addPaddingTranspose"] += timer.elapsed();
 }
 
 /*
@@ -319,7 +287,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
   float *col = (float *)aligned_alloc(32, _N * _K * sizeof(float));
   float *wei = (float *)aligned_alloc(32, _M * _K * sizeof(float));
 
-  addPadding(weight->buf, wei, K, C * R * S, _M, _K);
+  addPadding(weight->buf, wei, K, C, R, S);
   im2col(input, col, N, C, H, W, OH, OW, R, S, stride, pad, dilation);
   mat_mul(wei, col, output->buf, _M, _N, _K);
 
@@ -334,9 +302,36 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
     }
   }
 
-  free(col);
   time_map["Conv2d"] += timer.elapsed();
 }
+
+/*
+ * Add padding and transpose
+ * A: weight matrix (CKRS)
+ * B: padded and transposed weight matrix (KRS, C)
+*/
+void addPaddingTranspose(float *A, float *B, int K, int C, int R, int S) {
+  Timer timer;
+  int RS = R * S;
+
+  #pragma omp parallel for
+  for (int k = 0; k < K; ++k) {
+    for (int r = 0; r < R; ++r) {
+      for (int s = 0; s < S; ++s) {
+        int kr = (k * R + r) * S + s;
+        int baseB = kr * C;
+        for (int c = 0; c < C; ++c) {
+          // idx A: (c * K + k) * R*S + r*S + s
+          int idxA = (c * K + k) * RS + r * S + s;
+          B[baseB + c] = A[idxA];
+        }
+      }
+    }
+  }
+
+    time_map["addPaddingTranspose"] += timer.elapsed();
+}
+
 
 /*
  * Transposed convolution
@@ -353,34 +348,38 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
   int K = weight->shape[1], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
-  int _M = K;
-  int _N = round_up(OH * OW, 8);
-  int _K = round_up(C * R * S, 8);
+  int _M = K * R * S;
+  int _N = H * W;
+  int _K = C;
 
-  float *col = (float *)aligned_alloc(32, _N * _K * sizeof(float)); 
   float *wei = (float *)aligned_alloc(32, _M * _K * sizeof(float));
-  float *temp_output = (float *)aligned_alloc(32, N * _M * _N * sizeof(float));
+  float *temp = (float *)aligned_alloc(32, _M * _N * sizeof(float));
 
   addPaddingTranspose(weight->buf, wei, K, C, R, S);
-  im2col_tconv(input, col, N, C, H, W, OH, OW, R, S, stride, pad, 1);
-  mat_mul(wei, col, temp_output, _M, _N, _K);
 
+  mat_mul(wei, input->buf, temp, _M, _N, _K);
+
+  memset(output->buf, 0, N * K * OH * OW * sizeof(float));
+  // KRS x HW -> K x OH x OW
   #pragma omp parallel for collapse(3)
-  for (int n = 0; n < N; n++) {
-    for (int k = 0; k < K; k++) {
-      for (int oh = 0; oh < OH; oh++) {
-        for (int ow = 0; ow < OW; ow++) {
-          int temp_idx = n * K * _N + k * _N + oh * OW + ow;
-          int output_idx = n * K * OH * OW + k * OH * OW + oh * OW + ow;
-          output->buf[output_idx] = temp_output[temp_idx];
+  for (int k = 0; k < K; ++k) {
+    for (int r = 0; r < R; ++r) {
+      for (int s = 0; s < S; ++s) {
+        int kr = k * R * S + r * S + s; 
+        for (int h = 0; h < H; ++h) {
+          for (int w = 0; w < W; ++w) {
+            int oh = h * stride - pad + r;
+            int ow = w * stride - pad + s;
+            if (oh >= 0 && oh < OH && ow >= 0 && ow < OW) {
+              output->buf[k * (OH * OW) + oh * OW + ow] +=
+              temp[kr * (H * W) + h * W + w];
+            }
+          }
         }
       }
     }
   }
 
-  free(col);
-  free(wei);
-  free(temp_output);
   time_map["ConvTranspose2d"] += timer.elapsed();
 }
 
