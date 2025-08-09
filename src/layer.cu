@@ -37,33 +37,16 @@ void PixelNorm(Tensor *inout) {
   size_t C = inout->shape[1];
   
   float mean_squares = 0.f;
-  float* buf = inout->buf;
-
-  __m256 a, x, s = _mm256_set_ps(0., 0., 0., 0., 0., 0., 0., 0.);
-  size_t i;
-  for (i = 0; i < C - 7; i += 8) {
-    a = _mm256_load_ps(buf + i);
-    s = _mm256_fmadd_ps(a, a, s);
+  #pragma omp parallel for simd reduction(+:mean_squares)
+  for (size_t i = 0; i < C; i++) {
+    mean_squares += inout->buf[i] * inout->buf[i];
   }
-  for (; i < C; ++i) {
-    mean_squares += buf[i] * buf[i];
-  }
-  for (int i = 0; i < 8; ++i) {
-    mean_squares += s[i];
-  }
-
   mean_squares /= C;
   float norm_factor = rsqrtf(mean_squares + 1e-8f);
 
-  __m256 factor = _mm256_set1_ps(norm_factor);
-
-  for (i = 0; i < C - 7; i += 8) {
-    a = _mm256_load_ps(buf + i);
-    x = _mm256_mul_ps(a, factor);
-    _mm256_store_ps(buf + i, x);
-  }
-  for (; i < C; ++i) {
-    buf[i] *= norm_factor;
+  #pragma omp parallel for simd
+  for (size_t i = 0; i < C; i++) {
+    inout->buf[i] *= norm_factor;
   }
 
   time_map["PixelNorm"] += timer.elapsed();
@@ -186,7 +169,7 @@ static void im2col_nchw(const Tensor *input,
                         int N, int C, int H, int W, int OH, int OW) {
   Timer timer;
   // A shape: M x Kc where M = N*OH*OW
-  #pragma omp parallel for collapse(3)
+  #pragma omp parallel for collapse(2)
   for (int n = 0; n < N; ++n) {
     for (int oh = 0; oh < OH; ++oh) {
       for (int ow = 0; ow < OW; ++ow) {
@@ -223,7 +206,7 @@ static void im2col_tconv_nchw(const Tensor *input,
                               int N, int C, int H, int W, int OH, int OW) {
   Timer timer;
   // A shape: M x Kc where M = N*OH*OW
-  #pragma omp parallel for collapse(3)
+  #pragma omp parallel for collapse(2)
   for (int n = 0; n < N; ++n) {
     for (int oh = 0; oh < OH; ++oh) {
       for (int ow = 0; ow < OW; ++ow) {
@@ -304,7 +287,7 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 
   mat_mul(A, B, Cmat, (int)M, (int)Nc, (int)Kc);
 
-  #pragma omp parallel for collapse(3)
+  #pragma omp parallel for collapse(2)
   for (int n = 0; n < N; ++n) {
     for (int oh = 0; oh < OH; ++oh) {
       for (int ow = 0; ow < OW; ++ow) {
@@ -380,7 +363,7 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
 
   mat_mul(A, B, Cmat, (int)M, (int)Nc, (int)Kc);
 
-  #pragma omp parallel for collapse(3)
+  #pragma omp parallel for collapse(2)
   for (int n = 0; n < N; ++n) {
     for (int oh = 0; oh < OH; ++oh) {
       for (int ow = 0; ow < OW; ++ow) {
@@ -409,6 +392,7 @@ void transpose(Tensor *input, Tensor *output) {
   size_t H = input->shape[2];
   size_t W = input->shape[3];
 
+  #pragma omp parallel for collapse(2)
   for (size_t n = 0; n < N; n++) {
     for (size_t c = 0; c < C; c++) {
       for (size_t h = 0; h < H; h++) {
@@ -416,8 +400,8 @@ void transpose(Tensor *input, Tensor *output) {
         size_t base_out = ((c * N + n) * H + h) * W;
         size_t w = 0;
         for (; w + 8 <= W; w += 8) {
-          __m256 vec = _mm256_loadu_ps(input->buf + base_in + w);
-          _mm256_storeu_ps(output->buf + base_out + w, vec);
+          __m256 vec = _mm256_load_ps(input->buf + base_in + w);
+          _mm256_store_ps(output->buf + base_out + w, vec);
         }
         for (; w < W; ++w) {
           output->buf[base_out + w] = input->buf[base_in + w];
@@ -441,12 +425,12 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
   size_t K = w->shape[1];
 
   float scale = (1.0f / sqrtf(K)) * lr_mul;
-  __m256 x, y, s;
 
+  #pragma omp parallel for 
   for (size_t m = 0; m < M; m++) {
     for (size_t n = 0; n < N; n ++) {
       size_t k;
-      s = _mm256_set_ps(0., 0., 0., 0., 0., 0., 0., 0.);
+      __m256 x, y, s = _mm256_setzero_ps();
       for(k = 0; k + 7 < K; k += 8) {
         x = _mm256_load_ps((in->buf) + m * K + k);
         y = _mm256_load_ps((w->buf) + n * K + k);
@@ -475,20 +459,9 @@ void LeakyReLU(Tensor *inout) {
 
   float negative_slope = 0.2f;
   float scale = sqrtf(2.0f);
-  __m256 neg = _mm256_set1_ps(negative_slope * scale);
-  __m256 pos = _mm256_set1_ps(scale);
-  __m256 a, mask, rpos, rneg, result;
 
-  size_t i;
-  for (i = 0; i + 7 < N; i += 8) {
-    a = _mm256_loadu_ps(inout->buf + i);
-    mask = _mm256_cmp_ps(a, _mm256_setzero_ps(), _CMP_LT_OS);;
-    rneg = _mm256_mul_ps(a, neg);
-    rpos = _mm256_mul_ps(a, pos);
-    result = _mm256_blendv_ps(rpos, rneg, mask);
-    _mm256_storeu_ps(inout->buf + i, result);
-  }
-  for (; i < N; ++i) {
+  #pragma omp parallel for simd
+  for (size_t i = 0; i < N; i++) {
     if (inout->buf[i] < 0) { inout->buf[i] *= negative_slope; }
     inout->buf[i] *= scale;
   }
@@ -525,11 +498,12 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
 
   float scale = 1 / sqrtf((float) (in_C * kernel_size * kernel_size));
   size_t K = kernel_size * kernel_size;
-  __m256 a, s;
+  
 
+  #pragma omp parallel for
   for (size_t oc = 0; oc < out_C; oc++) {
     for (size_t ic = 0; ic < in_C; ic++) {
-      __m256 style = _mm256_set1_ps(style_a->buf[ic] * scale);
+      __m256 style = _mm256_set1_ps(style_a->buf[ic] * scale), a, s;
       size_t K_idx = oc * in_C * K + ic * K, k;
 
       for (k = 0; k + 7 < K; k += 8) {
@@ -545,8 +519,10 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   }
 
   if (demodulate) {
+    #pragma omp parallel for
     for (size_t oc = 0; oc < out_C; oc++) {
       float sum = 0.0f;
+      __m256 a, s;
       for (size_t ic = 0; ic < in_C; ic++) {
         size_t K_idx = oc * in_C * K + ic * K, k;
         s = _mm256_setzero_ps();
@@ -564,6 +540,7 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
       demod_a->buf[oc] = 1.0f / sqrtf(sum + 1e-8f);
     }
 
+    #pragma omp parallel for
     for (size_t oc = 0; oc < out_C; oc++) {
       __m256 demod = _mm256_set1_ps(demod_a->buf[oc]), a, s;
       for (size_t ic = 0; ic < in_C; ic++) {
@@ -604,13 +581,14 @@ void addNoise(Tensor *inout, Tensor *noise) {
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
 
-  __m256 a, b, result;
 
+  #pragma omp parallel for
   for (size_t c = 0; c < C; c++) {
     for (size_t h = 0; h < H; h++) {
       size_t w;
       size_t base_idx = (c * H + h) * W;
       size_t noise_idx = h * W;
+      __m256 a, b, result;
 
       for (w = 0; w + 7 < W; w += 8) {
         a = _mm256_load_ps(inout->buf + base_idx + w);
@@ -639,6 +617,7 @@ void addBias(Tensor *inout, Tensor *bias) {
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
 
+  #pragma omp parallel for
   for (size_t c = 0; c < C; c++) {
     __m256 bias_ = _mm256_set1_ps(bias->buf[c]), a, result;
     for (size_t h = 0; h < H; h++) {
@@ -668,16 +647,8 @@ void elemAdd(Tensor *inout, Tensor *addend) {
   Timer timer;
   size_t N = inout->num_elem();
 
-  size_t i;
-  __m256 a, b, s;
-  for (i = 0; i + 7 < N; i += 8) {
-    //inout->buf[i] += addend->buf[i];
-    a = _mm256_load_ps(inout->buf + i);
-    b = _mm256_load_ps(addend->buf + i);
-    s = _mm256_add_ps(a, b);
-    _mm256_store_ps(inout->buf + i, s);
-  }
-  for (; i < N; ++i) {
+  #pragma omp parallel for simd
+  for (size_t i = 0; i < N; i++) {
     inout->buf[i] += addend->buf[i];
   }
   time_map["elemAdd"] += timer.elapsed();
