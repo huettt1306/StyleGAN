@@ -649,134 +649,164 @@ void free_activations() {
 /* [Model Computation] */
 void generate(float *inputs, float *outputs, size_t n_samples) {  
   
-  int mpi_rank = 0;
+  int mpi_rank, mpi_size;
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
+  MPI_Comm_size(MPI_COMM_WORLD, &mpi_size);
 
-  if (mpi_rank == 0) {
-    for (size_t n = 0; n < n_samples; n++) {    
-      /* Load a style from the inputs */
-      Tensor *input = new Tensor({1, 512}, inputs + n * 512);
-      
-      /* Get latent from style */
-      PixelNorm(input);
+  int base = n_samples / mpi_size;
+  int extra = n_samples % mpi_size;
+  int local_n_samples = (mpi_rank < extra) ? base + 1 : base;  
+  int start = mpi_rank * base + (mpi_rank < extra ? mpi_rank : extra);
+  
+  float* local_inputs = new float[local_n_samples * 512];
+  float* local_outputs = new float[local_n_samples * 3 * 512 * 512];
 
-      Linear(input, mlp0_w, mlp0_b, mlp0_a, 0.01f);
-      LeakyReLU(mlp0_a);
+  std::vector<int> sendcounts(mpi_size), senddispls(mpi_size);
+  std::vector<int> recvcounts(mpi_size), recvdispls(mpi_size);
 
-      Linear(mlp0_a, mlp1_w, mlp1_b, mlp1_a, 0.01f);
-      LeakyReLU(mlp1_a);
+  if(mpi_rank == 0) {
+    for (int i = 0; i < mpi_size; i++) {
+      int samples = (i < extra) ? base + 1 : base;
+      sendcounts[i] = samples * 512;
+      senddispls[i] = (i == 0) ? 0 : senddispls[i - 1] + sendcounts[i - 1];
+      recvcounts[i] = samples * 3 * 512 * 512;
+      recvdispls[i] = (i == 0) ? 0 : recvdispls[i - 1] + recvcounts[i - 1];
+    } 
+  }
 
-      Linear(mlp1_a, mlp2_w, mlp2_b, mlp2_a, 0.01f);
-      LeakyReLU(mlp2_a);
+  MPI_Scatterv(inputs, sendcounts.data(), senddispls.data(), MPI_FLOAT, local_inputs, local_n_samples * 512, MPI_FLOAT, 0, MPI_COMM_WORLD);
 
-      Linear(mlp2_a, mlp3_w, mlp3_b, mlp3_a, 0.01f);
-      LeakyReLU(mlp3_a);
+  for (size_t n = 0; n < local_n_samples; n++) {
+    /* Load a style from the inputs */
+    Tensor *input = new Tensor({1, 512}, local_inputs + n * 512);
 
-      Linear(mlp3_a, mlp4_w, mlp4_b, mlp4_a, 0.01f);
-      LeakyReLU(mlp4_a);
+    /* Get latent from style */
+    PixelNorm(input);
 
-      Linear(mlp4_a, mlp5_w, mlp5_b, mlp5_a, 0.01f);
-      LeakyReLU(mlp5_a);
+    Linear(input, mlp0_w, mlp0_b, mlp0_a, 0.01f);
+    LeakyReLU(mlp0_a);
 
-      Linear(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f);
-      LeakyReLU(mlp6_a);
+    Linear(mlp0_a, mlp1_w, mlp1_b, mlp1_a, 0.01f);
+    LeakyReLU(mlp1_a);
 
-      Linear(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
-      LeakyReLU(mlp7_a); // mlp7_a is now the latent vector
+    Linear(mlp1_a, mlp2_w, mlp2_b, mlp2_a, 0.01f);
+    LeakyReLU(mlp2_a);
+
+    Linear(mlp2_a, mlp3_w, mlp3_b, mlp3_a, 0.01f);
+    LeakyReLU(mlp3_a);
+
+    Linear(mlp3_a, mlp4_w, mlp4_b, mlp4_a, 0.01f);
+    LeakyReLU(mlp4_a);
+
+    Linear(mlp4_a, mlp5_w, mlp5_b, mlp5_a, 0.01f);
+    LeakyReLU(mlp5_a);
+
+    Linear(mlp5_a, mlp6_w, mlp6_b, mlp6_a, 0.01f);
+    LeakyReLU(mlp6_a);
+
+    Linear(mlp6_a, mlp7_w, mlp7_b, mlp7_a, 0.01f);
+    LeakyReLU(mlp7_a); // mlp7_a is now the latent vector
 
       // Constant input
-      memcpy(constant_input_a->buf, constant_input->buf, 1 * 512 * 4 * 4 * sizeof(float));
+    memcpy(constant_input_a->buf, constant_input->buf, 1 * 512 * 4 * 4 * sizeof(float));
 
-      StyledConv(constant_input_a, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a, 
+    StyledConv(constant_input_a, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a, 
                 conv1_style_a, conv1_weight_a, conv1_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);
 
-      ToRGB(conv1_output_a, nullptr, mlp7_a, to_rgb_modulate_w, to_rgb_modulate_b, to_rgb_w, to_rgb_b, kernel, to_rgb_output_a, 
+    ToRGB(conv1_output_a, nullptr, mlp7_a, to_rgb_modulate_w, to_rgb_modulate_b, to_rgb_w, to_rgb_b, kernel, to_rgb_output_a, 
             to_rgb_style_a, to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr, nullptr,
-            false, false, 0); // to_rgb_output_a: skip
+            false, false, 0); 
 
       // Block 0
-      StyledConv(conv1_output_a, mlp7_a, block0_conv_up_modulate_w, block0_conv_up_modulate_b, block0_conv_up_w, block0_conv_up_b, kernel, block0_noise1, block0_conv_up_output_a,
+    StyledConv(conv1_output_a, mlp7_a, block0_conv_up_modulate_w, block0_conv_up_modulate_b, block0_conv_up_w, block0_conv_up_b, kernel, block0_noise1, block0_conv_up_output_a,
                 block0_conv_up_style_a, block0_conv_up_weight_a, block0_conv_up_demod_a, block0_conv_up_transpose_a, block0_conv_up_conv_a, block0_conv_up_upsample_a, block0_conv_up_conv2_a,
                 true, true, 0);
 
-      StyledConv(block0_conv_up_output_a, mlp7_a, block0_conv_modulate_w, block0_conv_modulate_b, block0_conv_w, block0_conv_b, kernel, block0_noise2, block0_conv_output_a,
+    StyledConv(block0_conv_up_output_a, mlp7_a, block0_conv_modulate_w, block0_conv_modulate_b, block0_conv_w, block0_conv_b, kernel, block0_noise2, block0_conv_output_a,
                 block0_conv_style_a, block0_conv_weight_a, block0_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
 
-      ToRGB(block0_conv_output_a, to_rgb_output_a, mlp7_a, block0_to_rgb_modulate_w, block0_to_rgb_modulate_b, block0_to_rgb_w, block0_to_rgb_b, kernel, block0_to_rgb_output_a,
+    ToRGB(block0_conv_output_a, to_rgb_output_a, mlp7_a, block0_to_rgb_modulate_w, block0_to_rgb_modulate_b, block0_to_rgb_w, block0_to_rgb_b, kernel, block0_to_rgb_output_a,
             block0_to_rgb_style_a, block0_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block0_to_rgb_skip_upsample_a, block0_to_rgb_skip_conv_a, block0_skip_a,
             false, false, 0);
 
       // Block 1
-      StyledConv(block0_conv_output_a, mlp7_a, block1_conv_up_modulate_w, block1_conv_up_modulate_b, block1_conv_up_w, block1_conv_up_b, kernel, block1_noise1, block1_conv_up_output_a,
+    StyledConv(block0_conv_output_a, mlp7_a, block1_conv_up_modulate_w, block1_conv_up_modulate_b, block1_conv_up_w, block1_conv_up_b, kernel, block1_noise1, block1_conv_up_output_a,
                 block1_conv_up_style_a, block1_conv_up_weight_a, block1_conv_up_demod_a, block1_conv_up_transpose_a, block1_conv_up_conv_a, block1_conv_up_upsample_a, block1_conv_up_conv2_a,
                 true, true, 0);
-      StyledConv(block1_conv_up_output_a, mlp7_a, block1_conv_modulate_w, block1_conv_modulate_b, block1_conv_w, block1_conv_b, kernel, block1_noise2, block1_conv_output_a,
+    StyledConv(block1_conv_up_output_a, mlp7_a, block1_conv_modulate_w, block1_conv_modulate_b, block1_conv_w, block1_conv_b, kernel, block1_noise2, block1_conv_output_a,
                 block1_conv_style_a, block1_conv_weight_a, block1_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
-      ToRGB(block1_conv_output_a, block0_to_rgb_output_a, mlp7_a, block1_to_rgb_modulate_w, block1_to_rgb_modulate_b, block1_to_rgb_w, block1_to_rgb_b, kernel, block1_to_rgb_output_a,
+    ToRGB(block1_conv_output_a, block0_to_rgb_output_a, mlp7_a, block1_to_rgb_modulate_w, block1_to_rgb_modulate_b, block1_to_rgb_w, block1_to_rgb_b, kernel, block1_to_rgb_output_a,
             block1_to_rgb_style_a, block1_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block1_to_rgb_skip_upsample_a, block1_to_rgb_skip_conv_a, block1_skip_a,
             false, false, 0);
 
       // Block 2
-      StyledConv(block1_conv_output_a, mlp7_a, block2_conv_up_modulate_w, block2_conv_up_modulate_b, block2_conv_up_w, block2_conv_up_b, kernel, block2_noise1, block2_conv_up_output_a,
+    StyledConv(block1_conv_output_a, mlp7_a, block2_conv_up_modulate_w, block2_conv_up_modulate_b, block2_conv_up_w, block2_conv_up_b, kernel, block2_noise1, block2_conv_up_output_a,
                 block2_conv_up_style_a, block2_conv_up_weight_a, block2_conv_up_demod_a, block2_conv_up_transpose_a, block2_conv_up_conv_a, block2_conv_up_upsample_a, block2_conv_up_conv2_a,
                 true, true, 0);
-      StyledConv(block2_conv_up_output_a, mlp7_a, block2_conv_modulate_w, block2_conv_modulate_b, block2_conv_w, block2_conv_b, kernel, block2_noise2, block2_conv_output_a,
+    StyledConv(block2_conv_up_output_a, mlp7_a, block2_conv_modulate_w, block2_conv_modulate_b, block2_conv_w, block2_conv_b, kernel, block2_noise2, block2_conv_output_a,
                 block2_conv_style_a, block2_conv_weight_a, block2_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
-      ToRGB(block2_conv_output_a, block1_to_rgb_output_a, mlp7_a, block2_to_rgb_modulate_w, block2_to_rgb_modulate_b, block2_to_rgb_w, block2_to_rgb_b, kernel, block2_to_rgb_output_a,
+    ToRGB(block2_conv_output_a, block1_to_rgb_output_a, mlp7_a, block2_to_rgb_modulate_w, block2_to_rgb_modulate_b, block2_to_rgb_w, block2_to_rgb_b, kernel, block2_to_rgb_output_a,
             block2_to_rgb_style_a, block2_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block2_to_rgb_skip_upsample_a, block2_to_rgb_skip_conv_a, block2_skip_a,
             false, false, 0);
 
       // Block 3
-      StyledConv(block2_conv_output_a, mlp7_a, block3_conv_up_modulate_w, block3_conv_up_modulate_b, block3_conv_up_w, block3_conv_up_b, kernel, block3_noise1, block3_conv_up_output_a,
+    StyledConv(block2_conv_output_a, mlp7_a, block3_conv_up_modulate_w, block3_conv_up_modulate_b, block3_conv_up_w, block3_conv_up_b, kernel, block3_noise1, block3_conv_up_output_a,
                 block3_conv_up_style_a, block3_conv_up_weight_a, block3_conv_up_demod_a, block3_conv_up_transpose_a, block3_conv_up_conv_a, block3_conv_up_upsample_a, block3_conv_up_conv2_a,
                 true, true, 0);
-      StyledConv(block3_conv_up_output_a, mlp7_a, block3_conv_modulate_w, block3_conv_modulate_b, block3_conv_w, block3_conv_b, kernel, block3_noise2, block3_conv_output_a,
+    StyledConv(block3_conv_up_output_a, mlp7_a, block3_conv_modulate_w, block3_conv_modulate_b, block3_conv_w, block3_conv_b, kernel, block3_noise2, block3_conv_output_a,
                 block3_conv_style_a, block3_conv_weight_a, block3_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
-      ToRGB(block3_conv_output_a, block2_to_rgb_output_a, mlp7_a, block3_to_rgb_modulate_w, block3_to_rgb_modulate_b, block3_to_rgb_w, block3_to_rgb_b, kernel, block3_to_rgb_output_a,
+    ToRGB(block3_conv_output_a, block2_to_rgb_output_a, mlp7_a, block3_to_rgb_modulate_w, block3_to_rgb_modulate_b, block3_to_rgb_w, block3_to_rgb_b, kernel, block3_to_rgb_output_a,
             block3_to_rgb_style_a, block3_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block3_to_rgb_skip_upsample_a, block3_to_rgb_skip_conv_a, block3_skip_a,
             false, false, 0);
 
       // Block 4
-      StyledConv(block3_conv_output_a, mlp7_a, block4_conv_up_modulate_w, block4_conv_up_modulate_b, block4_conv_up_w, block4_conv_up_b, kernel, block4_noise1, block4_conv_up_output_a,
+    StyledConv(block3_conv_output_a, mlp7_a, block4_conv_up_modulate_w, block4_conv_up_modulate_b, block4_conv_up_w, block4_conv_up_b, kernel, block4_noise1, block4_conv_up_output_a,
                 block4_conv_up_style_a, block4_conv_up_weight_a, block4_conv_up_demod_a, block4_conv_up_transpose_a, block4_conv_up_conv_a, block4_conv_up_upsample_a, block4_conv_up_conv2_a,
                 true, true, 0);
-      StyledConv(block4_conv_up_output_a, mlp7_a, block4_conv_modulate_w, block4_conv_modulate_b, block4_conv_w, block4_conv_b, kernel, block4_noise2, block4_conv_output_a,
+    StyledConv(block4_conv_up_output_a, mlp7_a, block4_conv_modulate_w, block4_conv_modulate_b, block4_conv_w, block4_conv_b, kernel, block4_noise2, block4_conv_output_a,
                 block4_conv_style_a, block4_conv_weight_a, block4_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
-      ToRGB(block4_conv_output_a, block3_to_rgb_output_a, mlp7_a, block4_to_rgb_modulate_w, block4_to_rgb_modulate_b, block4_to_rgb_w, block4_to_rgb_b, kernel, block4_to_rgb_output_a,
+    ToRGB(block4_conv_output_a, block3_to_rgb_output_a, mlp7_a, block4_to_rgb_modulate_w, block4_to_rgb_modulate_b, block4_to_rgb_w, block4_to_rgb_b, kernel, block4_to_rgb_output_a,
             block4_to_rgb_style_a, block4_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block4_to_rgb_skip_upsample_a, block4_to_rgb_skip_conv_a, block4_skip_a,
             false, false, 0);
 
       // Block 5
-      StyledConv(block4_conv_output_a, mlp7_a, block5_conv_up_modulate_w, block5_conv_up_modulate_b, block5_conv_up_w, block5_conv_up_b, kernel, block5_noise1, block5_conv_up_output_a,
+    StyledConv(block4_conv_output_a, mlp7_a, block5_conv_up_modulate_w, block5_conv_up_modulate_b, block5_conv_up_w, block5_conv_up_b, kernel, block5_noise1, block5_conv_up_output_a,
                 block5_conv_up_style_a, block5_conv_up_weight_a, block5_conv_up_demod_a, block5_conv_up_transpose_a, block5_conv_up_conv_a, block5_conv_up_upsample_a, block5_conv_up_conv2_a,
                 true, true, 0);
-      StyledConv(block5_conv_up_output_a, mlp7_a, block5_conv_modulate_w, block5_conv_modulate_b, block5_conv_w, block5_conv_b, kernel, block5_noise2, block5_conv_output_a,
+    StyledConv(block5_conv_up_output_a, mlp7_a, block5_conv_modulate_w, block5_conv_modulate_b, block5_conv_w, block5_conv_b, kernel, block5_noise2, block5_conv_output_a,
                 block5_conv_style_a, block5_conv_weight_a, block5_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
-      ToRGB(block5_conv_output_a, block4_to_rgb_output_a, mlp7_a, block5_to_rgb_modulate_w, block5_to_rgb_modulate_b, block5_to_rgb_w, block5_to_rgb_b, kernel, block5_to_rgb_output_a,
+    ToRGB(block5_conv_output_a, block4_to_rgb_output_a, mlp7_a, block5_to_rgb_modulate_w, block5_to_rgb_modulate_b, block5_to_rgb_w, block5_to_rgb_b, kernel, block5_to_rgb_output_a,
             block5_to_rgb_style_a, block5_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block5_to_rgb_skip_upsample_a, block5_to_rgb_skip_conv_a, block5_skip_a,
             false, false, 0);
 
       // Block 6
-      StyledConv(block5_conv_output_a, mlp7_a, block6_conv_up_modulate_w, block6_conv_up_modulate_b, block6_conv_up_w, block6_conv_up_b, kernel, block6_noise1, block6_conv_up_output_a,
+    StyledConv(block5_conv_output_a, mlp7_a, block6_conv_up_modulate_w, block6_conv_up_modulate_b, block6_conv_up_w, block6_conv_up_b, kernel, block6_noise1, block6_conv_up_output_a,
                 block6_conv_up_style_a, block6_conv_up_weight_a, block6_conv_up_demod_a, block6_conv_up_transpose_a, block6_conv_up_conv_a, block6_conv_up_upsample_a, block6_conv_up_conv2_a,
                 true, true, 0);
-      StyledConv(block6_conv_up_output_a, mlp7_a, block6_conv_modulate_w, block6_conv_modulate_b, block6_conv_w, block6_conv_b, kernel, block6_noise2, block6_conv_output_a,
+    StyledConv(block6_conv_up_output_a, mlp7_a, block6_conv_modulate_w, block6_conv_modulate_b, block6_conv_w, block6_conv_b, kernel, block6_noise2, block6_conv_output_a,
                 block6_conv_style_a, block6_conv_weight_a, block6_conv_demod_a, nullptr, nullptr, nullptr, nullptr,
                 true, false, 1);  
-      ToRGB(block6_conv_output_a, block5_to_rgb_output_a, mlp7_a, block6_to_rgb_modulate_w, block6_to_rgb_modulate_b, block6_to_rgb_w, block6_to_rgb_b, kernel, block6_to_rgb_output_a,
+    ToRGB(block6_conv_output_a, block5_to_rgb_output_a, mlp7_a, block6_to_rgb_modulate_w, block6_to_rgb_modulate_b, block6_to_rgb_w, block6_to_rgb_b, kernel, block6_to_rgb_output_a,
             block6_to_rgb_style_a, block6_to_rgb_weight_a, nullptr, nullptr, nullptr, nullptr, nullptr, block6_to_rgb_skip_upsample_a, block6_to_rgb_skip_conv_a, block6_skip_a,
             false, false, 0);
 
       /* Copy the result (512x512 RGB image) to outputs */
-      memcpy(outputs + n * 3 * 512 * 512, block6_to_rgb_output_a->buf, 3 * 512 * 512 * sizeof(float));
-      printTimeMap();
-    }
+    memcpy(local_outputs + n * 3 * 512 * 512, block6_to_rgb_output_a->buf, 3 * 512 * 512 * sizeof(float));
+    // printTimeMap();
   }
+
+  MPI_Gatherv(local_outputs, local_n_samples * 3 * 512 * 512, MPI_FLOAT,
+              outputs, recvcounts.data(), recvdispls.data(), MPI_FLOAT,
+              0, MPI_COMM_WORLD);
+
+  // Clean up
+  delete[] local_inputs;
+  delete[] local_outputs;
 }
