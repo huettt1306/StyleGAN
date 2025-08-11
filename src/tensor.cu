@@ -1,5 +1,18 @@
 #include "model.h"
+#include "tensor.h"
+#include <cstring>
+#include <cstdlib>
+#include <vector>
 
+#define CHECK_CUDA(call)                                                 \
+  do {                                                                   \
+    cudaError_t status_ = call;                                          \
+    if (status_ != cudaSuccess) {                                        \
+      fprintf(stderr, "CUDA error (%s:%d): %s:%s\n", __FILE__, __LINE__, \
+              cudaGetErrorName(status_), cudaGetErrorString(status_));   \
+      exit(EXIT_FAILURE);                                                \
+    }                                                                    \
+  } while (0)
 
 /* [Tensor Structure] */
 /* Tensor
@@ -13,20 +26,20 @@ Tensor::Tensor(const vector<size_t> &shape_) {
   ndim = shape_.size();
   for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
   size_t N_ = num_elem();
-  buf = (float*) aligned_alloc(32, N_ * sizeof(float)); 
-  memset(buf, 0, N_ * sizeof(float));
+  CHECK_CUDA(cudaMalloc((void**)&buf, N_ * sizeof(float)));
+  CHECK_CUDA(cudaMemset(buf, 0, N_ * sizeof(float)));
 }
 
 Tensor::Tensor(const vector<size_t> &shape_, float *buf_) {
   ndim = shape_.size();
   for (size_t i = 0; i < ndim; i++) { shape[i] = shape_[i]; }
   size_t N_ = num_elem();
-  buf = (float*) aligned_alloc(32, N_ * sizeof(float)); 
-  memcpy(buf, buf_, N_ * sizeof(float));
+  CHECK_CUDA(cudaMalloc((void**)&buf, N_ * sizeof(float)));
+  CHECK_CUDA(cudaMemcpy(buf, buf_, N_ * sizeof(float), cudaMemcpyHostToDevice));
 }
 
 Tensor::~Tensor() {
-  if (buf != nullptr) free(buf);
+  if (buf != nullptr) cudaFree(buf);
 }
 
 size_t Tensor::num_elem() {

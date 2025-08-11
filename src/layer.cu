@@ -31,22 +31,66 @@ static std::map<std::string, double> time_map;
   * Equivalent to: input * torch.rsqrt(torch.mean(input ** 2, dim=1, keepdim=True) + 1e-8)
   */
 
+__global__ void reduction_square(float *A, float *sum_square, size_t C) {
+	int i = blockIdx.x * blockDim.x + threadIdx.x;
+	if (i < C) {
+		atomicAdd(sum_square, A[i] * A[i] / C);
+	}
+}
+
+__global__ void normalize(float *A, float* norm_factor, size_t C) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < C) {
+    A[i] *= rsqrtf(*norm_factor + 1e-8f);
+  }
+}
+
+/*
+  * PixelNorm
+  * @param [in & out] inout: [N, C]
+  * Normalizes the input tensor along dim=1.
+  * Equivalent to: input * torch.rsqrt(torch.mean(input ** 2, dim=1, keepdim=True) + 1e-8)
+  */
 void PixelNorm(Tensor *inout) {
   Timer timer;
   size_t C = inout->shape[1];
-  
-  float mean_squares = 0.f;
-  for (size_t i = 0; i < C; i++) {
-    mean_squares += inout->buf[i] * inout->buf[i];
-  }
-  mean_squares /= C;
-  float norm_factor = rsqrtf(mean_squares + 1e-8f);
+  // printf("PixelNorm %d\n", C);
 
-  for (size_t i = 0; i < C; i++) {
-    inout->buf[i] *= norm_factor;
-  }
+  dim3 blockDim(256);
+  dim3 gridDim((C + blockDim.x - 1) / blockDim.x);
+
+  // Allocate and initialize mean_square in global memory
+  float *d_mean_square;
+  CHECK_CUDA(cudaMalloc(&d_mean_square, sizeof(float)));
+  CHECK_CUDA(cudaMemset(d_mean_square, 0, sizeof(float)));
+
+  // Launch kernel 
+  reduction_square<<<gridDim, blockDim>>>(inout->buf, d_mean_square, C);
+  CHECK_CUDA(cudaDeviceSynchronize());
+  normalize<<<gridDim, blockDim>>>(inout->buf, d_mean_square, C);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
+  // Free the allocated memory
+  CHECK_CUDA(cudaFree(d_mean_square));
 
   time_map["PixelNorm"] += timer.elapsed();
+}
+
+
+// ---------Upsample and Pad---------
+
+__global__ void upsample_pad_kernel(float *input, float *output, int C, int H, int W, int up, int pad0, int pad1) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  int h = blockIdx.y * blockDim.y + threadIdx.y;
+  int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if(c >= C || h >= H || w >= W) return;
+
+  int OH = H * up + pad0 + pad1;
+  int OW = W * up + pad0 + pad1;
+
+  atomicAdd(&output[c * OH * OW + (h * up + pad0) * OW + (w * up + pad0)],
+        input[c * H * W + h * W + w]);
 }
 
 /*
@@ -63,19 +107,36 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
   size_t H = input->shape[2];
   size_t W = input->shape[3];
 
+  // printf("UpsamplePad %d %d %d %d %d %d\n", N, C, H, W, up, pad0, pad1);
+
   size_t OH = up * H + pad0 + pad1;
   size_t OW = up * W + pad0 + pad1;
 
-  memset(output->buf, 0, N * C * OH * OW * sizeof(float));
-  for (size_t c = 0; c < C; ++c) {
-    for (size_t h = 0; h < H; ++h) {
-      for (size_t w = 0; w < W; ++w) {
-        output->buf[c * OH * OW + (h * up + pad0) * OW + w * up + pad0] +=
-        input->buf[c * H * W + h * W + w];
-      }
-    }
-  }
+  // memset(output->buf, 0, N * C * OH * OW * sizeof(float));
+  CHECK_CUDA(cudaMemset(output->buf, 0, N * C * OH * OW * sizeof(float)));
+
+  dim3 blockDim(1, 16, 16);
+  dim3 gridDim((C + blockDim.x - 1) / blockDim.x,
+               (H + blockDim.y - 1) / blockDim.y,  // H, không phải OH
+               (W + blockDim.z - 1) / blockDim.z); // W, không phải OW
+  upsample_pad_kernel<<<gridDim, blockDim>>>(input->buf, output->buf, C, H, W, up, pad0, pad1);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   time_map["UpsamplePad"] += timer.elapsed();
+}
+
+
+__global__ void mat_mul_kernel(float *A, float *B, float *C, int M, int N, int K) {
+  int j = blockIdx.x * blockDim.x + threadIdx.x;
+  int i = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (i < M && j < N) {
+    float sum = 0.0f;
+    for (int k = 0; k < K; ++k) {
+      sum += A[i * K + k] * B[k * N + j];
+    }
+    C[i * N + j] = sum;
+  }
 }
 
 /*
@@ -83,69 +144,50 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
  * A: (M, K), B: (K, N), C: (M, N)
  */
 void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
+  // printf("Matrix Multiplication %d %d %d\n", M, N, K);
   Timer timer;
-  #pragma omp parallel num_threads(32)
-  {
-    int tid = omp_get_thread_num();
-    cpu_set_t cpuset;
-    CPU_ZERO(&cpuset);
-    CPU_SET(tid, &cpuset);
-    sched_setaffinity(0, sizeof(cpu_set_t), &cpuset);
+  
+  // memset(C, 0, M * N * sizeof(float));
+  CHECK_CUDA(cudaMemset(C, 0, M * N * sizeof(float)));
+  dim3 blockDim(16, 16);
+  dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+  mat_mul_kernel<<<gridDim, blockDim>>>(A, B, C, M, N, K);
+  CHECK_CUDA(cudaDeviceSynchronize());
 
-    #pragma omp for simd
-    for (int i = 0; i < M * N; i++) {
-      C[i] = 0.0f;
-    }
+  time_map["matmul"] += timer.elapsed();
+}
 
-    #pragma omp for collapse(2)
-    for (int i = 0; i < M; i += ITILESIZE) {
-      for (int j = 0; j < N; j += JTILESIZE) {
-        for (int k = 0; k < K; k += KTILESIZE) {
-          for (int kk = k; kk < K && kk < k + KTILESIZE; kk += 8) {
-            for (int ii = i; ii < M && ii < i + ITILESIZE; ii++) {
-              __m256 a0 = _mm256_set1_ps(A[ii*K + (kk+0)]);
-              __m256 a1 = _mm256_set1_ps(A[ii*K + (kk+1)]);
-              __m256 a2 = _mm256_set1_ps(A[ii*K + (kk+2)]);
-              __m256 a3 = _mm256_set1_ps(A[ii*K + (kk+3)]);
-              __m256 a4 = _mm256_set1_ps(A[ii*K + (kk+4)]);
-              __m256 a5 = _mm256_set1_ps(A[ii*K + (kk+5)]);
-              __m256 a6 = _mm256_set1_ps(A[ii*K + (kk+6)]);
-              __m256 a7 = _mm256_set1_ps(A[ii*K + (kk+7)]);
+__host__ __device__ static inline size_t round_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
 
-              for (int jj = j; jj < N && jj < j + JTILESIZE; jj += 8) {
-                __m256 c0 = _mm256_load_ps(&C[ii * N + jj]);
+// ---------Image to col---------
+__global__ void im2col_kernel(float *input, float* output, 
+                              int N, int C, int H, int W, 
+                              int OH, int OW, int R, int S, 
+                              int stride, int pad, int dilation) {
+  int ow = blockIdx.x * blockDim.x + threadIdx.x;
+  int oh = blockIdx.y * blockDim.y + threadIdx.y;
+  // n, c calculate from z 
+  int n = blockIdx.z / C;
+  int c = blockIdx.z % C;
 
-                __m256 b0 = _mm256_load_ps(&B[(kk+0) * N + jj]);
-                __m256 b1 = _mm256_load_ps(&B[(kk+1) * N + jj]);
-                __m256 b2 = _mm256_load_ps(&B[(kk+2) * N + jj]);
-                __m256 b3 = _mm256_load_ps(&B[(kk+3) * N + jj]);
-                __m256 b4 = _mm256_load_ps(&B[(kk+4) * N + jj]);
-                __m256 b5 = _mm256_load_ps(&B[(kk+5) * N + jj]);
-                __m256 b6 = _mm256_load_ps(&B[(kk+6) * N + jj]);
-                __m256 b7 = _mm256_load_ps(&B[(kk+7) * N + jj]);
-
-                c0 = _mm256_fmadd_ps(a0, b0, c0);
-                c0 = _mm256_fmadd_ps(a1, b1, c0);
-                c0 = _mm256_fmadd_ps(a2, b2, c0);
-                c0 = _mm256_fmadd_ps(a3, b3, c0);
-                c0 = _mm256_fmadd_ps(a4, b4, c0);
-                c0 = _mm256_fmadd_ps(a5, b5, c0);
-                c0 = _mm256_fmadd_ps(a6, b6, c0);
-                c0 = _mm256_fmadd_ps(a7, b7, c0);
-
-                _mm256_store_ps(&C[ii * N + jj], c0);
-              }
-            }
-          }
+  if (n < N && c < C && oh < OH && ow < OW) {
+    int h_start = oh * stride - pad;
+    int w_start = ow * stride - pad;
+    for (int r = 0; r < R; ++r) {
+      for (int s = 0; s < S; ++s) {
+        int h = h_start + r * dilation;
+        int w = w_start + s * dilation;
+        if (h >= 0 && h < H && w >= 0 && w < W) {
+          output[((c * R + r) * S + s) * N * OH * OW + n * OH * OW + oh * OW + ow] =
+              input[n * C * H * W + c * H * W + h * W + w];
+        } else {
+          output[((c * R + r) * S + s) * N * OH * OW + n * OH * OW + oh * OW + ow] = 0.0f;
         }
       }
     }
   }
 
-  time_map["matmul"] += timer.elapsed();
 }
-
-static inline size_t round_up(size_t x, size_t a) { return (x + a - 1) / a * a; }
 
 /*
  * im2col
@@ -155,110 +197,56 @@ static inline size_t round_up(size_t x, size_t a) { return (x + a - 1) / a * a; 
  */
 void im2col (const Tensor *img, float *col, int N, int C, int H, int W, int OH, int OW,
              int R, int S, int stride, int pad, int dilation) {
+  // printf("im2col %d %d %d %d %d %d %d %d %d %d %d %d %d\n", N, C, H, W, OH, OW, R, S, stride, pad, dilation);
   Timer timer;
 
-  #pragma omp parallel for collapse(4)
-  for (int n = 0; n < N; ++n) {
-    for (int c = 0; c < C; ++c) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          int h_start = oh * stride - pad;
-          int w_start = ow * stride - pad;
-          int h_end = h_start + dilation * (R - 1) + 1;
-          int w_end = w_start + dilation * (S - 1) + 1;
+  CHECK_CUDA(cudaMemset(col, 0, round_up(C * R * S, 8) * N * OH * OW * sizeof(float)));
+  dim3 blockDim(16, 16);
+  dim3 gridDim((OW + blockDim.x - 1) / blockDim.x, (OH + blockDim.y - 1) / blockDim.y, N * C);
 
-          for (int r = 0; r < R; ++r) {
-            for (int s = 0; s < S; ++s) {
-              int h = h_start + r * dilation;
-              int w = w_start + s * dilation;
-
-              if (h >= 0 && h < H && w >= 0 && w < W) {
-                col[((c * R + r) * S + s) * N * OH * OW + n * OH * OW + oh * OW + ow] =
-                    img->buf[n * C * H * W + c * H * W + h * W + w];
-              } else {
-                col[((c * R + r) * S + s) * N * OH * OW + n * OH * OW + oh * OW + ow] = 0.0f;
-              }
-            }
-          }
-        }
-      }
-    }
-  }
-
-  int padded_CRS = round_up(C * R * S, 8);
-  #pragma omp parallel for collapse(2)
-  for (int i = C * R * S; i < padded_CRS; ++i) {
-    for (int j = 0; j < N * OH * OW; ++j) {
-      col[i * N * OH * OW + j] = 0.0f;
-    }
-  }
+  im2col_kernel<<<gridDim, blockDim>>>(img->buf, col, N, C, H, W, OH, OW, R, S, stride, pad, dilation);
+  CHECK_CUDA(cudaDeviceSynchronize());
 
   time_map["im2col"] += timer.elapsed();
 }
 
-/*
- * im2col for transposed convolution
- * For transposed conv, we need to map each output position to input positions
- * image shape = (N, C, H, W)
- * col shape = (round_up(C x R x S, 8), round_up(OH x OW, 8))
- */
-void im2col_tconv(const Tensor *img, float *col, int N, int C, int H, int W, int OH, int OW,
-                  int R, int S, int stride, int pad, int dilation) {
-  Timer timer;
+// --------Convolution Layer---------
+__global__ void add_bias_kernel(float *output, float *bias, int K, int OH, int OW) {
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int oh = blockIdx.y * blockDim.y + threadIdx.y;
+  int ow = blockIdx.z * blockDim.z + threadIdx.z;
 
-  int padded_CRS = round_up(C * R * S, 8);
-  int padded_OHOW = round_up(OH * OW, 8);
-  memset(col, 0, padded_CRS * padded_OHOW * sizeof(float));
-
-  #pragma omp parallel for collapse(4)
-  for (int n = 0; n < N; ++n) {
-    for (int c = 0; c < C; ++c) {
-      for (int h = 0; h < H; ++h) {
-        for (int w = 0; w < W; ++w) {
-          float input_val = img->buf[n * C * H * W + c * H * W + h * W + w];
-          
-          for (int r = 0; r < R; ++r) {
-            for (int s = 0; s < S; ++s) {
-              int oh = h * stride - pad + r;
-              int ow = w * stride - pad + s;
-              
-              if (oh >= 0 && oh < OH && ow >= 0 && ow < OW) {
-                int crs_idx = (c * R + r) * S + s;
-                int spatial_idx = oh * OW + ow; 
-                int col_idx = crs_idx * padded_OHOW + spatial_idx;
-                col[col_idx] = input_val;
-              }
-            }
-          }
-        }
-      }
-    }
+  if (k < K && oh < OH && ow < OW) {
+    atomicAdd(&output[k * OH * OW + oh * OW + ow], bias[k]);
   }
-
-  time_map["im2col_tconv"] += timer.elapsed();
 }
 
-/*
- * Add padding to weight matrix
- * A: weight matrix (K, CRS) = (M, N)
- * B: padded weight matrix (K, round_up(CRS, 8)) = (M_, N_)
-*/
+__global__ void add_padding_kernel(float *A, float *B, int K, int C, int R, int S) {
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int j = blockIdx.y * blockDim.y + threadIdx.y;
+  
+  int N = C * R * S;
+  int N_ = round_up(N, 8);
+
+  if (k < K && j < N_) {
+    if (j < N) {
+      B[k * N_ + j] = A[k * N + j];
+    } else {
+      B[k * N_ + j] = 0.0f;
+    }
+  }
+}
+
 void addPadding(float *A, float *B, int K, int C, int R, int S) {
   Timer timer;
 
   int N_ = round_up(C * R * S, 8);
   int N = C * R * S;
 
-  #pragma omp parallel for collapse(2)
-  for (int i = 0; i < K; ++i) {
-    for (int j = 0; j < N_; ++j) {
-      if (i < K && j < N) {
-        B[i * N_ + j] = A[i * N + j];
-      } else {
-        B[i * N_ + j] = 0.0f;
-      }
-    }
-  }
+  dim3 blockDim(16, 16);
+  dim3 gridDim((K + blockDim.x - 1) / blockDim.x, (N_ + blockDim.y - 1) / blockDim.y);
+  add_padding_kernel<<<gridDim, blockDim>>>(A, B, K, C, R, S);
+  CHECK_CUDA(cudaDeviceSynchronize());
 
   time_map["addPadding"] += timer.elapsed();
 }
@@ -274,37 +262,59 @@ void addPadding(float *A, float *B, int K, int C, int R, int S) {
  */
 void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
             int stride, int pad, int dilation, bool has_bias) {
-
   Timer timer;
   int N = input->shape[0], C = input->shape[1], H = input->shape[2], W = input->shape[3];
   int K = weight->shape[0], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
+  // printf("Conv2d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", N, C, H, W, OH, OW, R, S, stride, pad, dilation);
+
   int _M = K;
   int _N = N * OH * OW;
   int _K = round_up(C * R * S, 8);
 
-  float *col = (float *)aligned_alloc(32, _N * _K * sizeof(float));
-  float *wei = (float *)aligned_alloc(32, _M * _K * sizeof(float));
+  // float *col = (float *)aligned_alloc(32, _N * _K * sizeof(float));
+  // float *wei = (float *)aligned_alloc(32, _M * _K * sizeof(float));
+  float *col, *wei;
+  CHECK_CUDA(cudaMalloc((void**)&col, _N * _K * sizeof(float)));
+  CHECK_CUDA(cudaMalloc((void**)&wei, _M * _K * sizeof(float)));
 
   addPadding(weight->buf, wei, K, C, R, S);
   im2col(input, col, N, C, H, W, OH, OW, R, S, stride, pad, dilation);
   mat_mul(wei, col, output->buf, _M, _N, _K);
 
   if (has_bias) {
-    #pragma omp parallel for
-    for (int k = 0; k < K; ++k) {
-      for (int oh = 0; oh < OH; ++oh) {
-        for (int ow = 0; ow < OW; ++ow) {
-          output->buf[k * OH * OW + oh * OW + ow] += bias->buf[k];
-        }
-      }
-    }
+    dim3 blockDim(1, 16, 16);
+    dim3 gridDim((K + blockDim.x - 1) / blockDim.x, (OH + blockDim.y - 1) / blockDim.y, (OW + blockDim.z - 1) / blockDim.z);
+    add_bias_kernel<<<gridDim, blockDim>>>(output->buf, bias->buf, K, OH, OW);
+    CHECK_CUDA(cudaDeviceSynchronize());
   }
 
+  // Free memory - thêm dòng này
+  CHECK_CUDA(cudaFree(col));
+  CHECK_CUDA(cudaFree(wei));  // Thêm dòng này
+  
   time_map["Conv2d"] += timer.elapsed();
 }
 
+
+// --------Transpose Convolution Layer---------
+
+__global__ void addPaddingTranspose_kernel(float *A, float *B, int K, int C, int R, int S) {
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int c = blockIdx.y * blockDim.y + threadIdx.y;
+
+  if (k < K && c < C) {
+    for (int r = 0; r < R; ++r) {
+      for (int s = 0; s < S; ++s) {
+        int kr = (k * R + r) * S + s;
+        int baseB = kr * C;
+        int idxA = (c * K + k) * R * S + r * S + s;
+        B[baseB + c] = A[idxA];
+      }
+    }
+  }
+}
 /*
  * Add padding and transpose
  * A: weight matrix (CKRS)
@@ -312,26 +322,40 @@ void Conv2d(Tensor *input, Tensor *weight, Tensor *bias, Tensor *output,
 */
 void addPaddingTranspose(float *A, float *B, int K, int C, int R, int S) {
   Timer timer;
-  int RS = R * S;
+  // printf("addPaddingTranspose %d %d %d %d %d %d\n", K, C, R, S);
+  dim3 blockDim(16, 16);
+  dim3 gridDim((K + blockDim.x - 1) / blockDim.x, 
+               (C + blockDim.y - 1) / blockDim.y);
+  // memset(B, 0, K * R * S * C * sizeof(float));
+  addPaddingTranspose_kernel<<<gridDim, blockDim>>>(A, B, K, C, R, S);
+  CHECK_CUDA(cudaDeviceSynchronize());
 
-  #pragma omp parallel for
-  for (int k = 0; k < K; ++k) {
-    for (int r = 0; r < R; ++r) {
-      for (int s = 0; s < S; ++s) {
-        int kr = (k * R + r) * S + s;
-        int baseB = kr * C;
-        for (int c = 0; c < C; ++c) {
-          // idx A: (c * K + k) * R*S + r*S + s
-          int idxA = (c * K + k) * RS + r * S + s;
-          B[baseB + c] = A[idxA];
+  time_map["addPaddingTranspose"] += timer.elapsed();
+}
+
+
+__global__ void reshape_kernel(float *input, float *output, 
+                               int N, int K, int H, int W, 
+                               int R, int S, int stride, int pad,
+                               int OH, int OW) {
+  int k = blockIdx.x * blockDim.x + threadIdx.x;
+  int h = blockIdx.y * blockDim.y + threadIdx.y;
+  int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (k < K && h < H && w < W) {
+    for (int r = 0; r < R; r++) {
+      for (int s = 0; s < S; s++) {
+        int kr = k * R * S + r * S + s; 
+        int oh = h * stride - pad + r;
+        int ow = w * stride - pad + s;
+        if (oh >= 0 && oh < OH && ow >= 0 && ow < OW) {
+          atomicAdd(&output[k * (OH * OW) + oh * OW + ow],
+          input[kr * (H * W) + h * W + w]);
         }
       }
     }
   }
-
-    time_map["addPaddingTranspose"] += timer.elapsed();
 }
-
 
 /*
  * Transposed convolution
@@ -348,39 +372,49 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
   int K = weight->shape[1], R = weight->shape[2], S = weight->shape[3];
   int OH = output->shape[2], OW = output->shape[3];
 
+  // printf("ConvTranspose2d %d %d %d %d %d %d %d %d %d %d %d %d %d\n", N, C, H, W, K, R, S, OH, OW, stride, pad);
+
+
   int _M = K * R * S;
   int _N = H * W;
   int _K = C;
 
-  float *wei = (float *)aligned_alloc(32, _M * _K * sizeof(float));
-  float *temp = (float *)aligned_alloc(32, _M * _N * sizeof(float));
+  float *wei, *temp;
+  CHECK_CUDA(cudaMalloc((void**)&wei, _M * _K * sizeof(float)));
+  CHECK_CUDA(cudaMalloc((void**)&temp, _M * _N * sizeof(float)));
 
   addPaddingTranspose(weight->buf, wei, K, C, R, S);
 
   mat_mul(wei, input->buf, temp, _M, _N, _K);
 
-  memset(output->buf, 0, N * K * OH * OW * sizeof(float));
-  // KRS x HW -> K x OH x OW
-  #pragma omp parallel for collapse(3)
-  for (int k = 0; k < K; ++k) {
-    for (int r = 0; r < R; ++r) {
-      for (int s = 0; s < S; ++s) {
-        int kr = k * R * S + r * S + s; 
-        for (int h = 0; h < H; ++h) {
-          for (int w = 0; w < W; ++w) {
-            int oh = h * stride - pad + r;
-            int ow = w * stride - pad + s;
-            if (oh >= 0 && oh < OH && ow >= 0 && ow < OW) {
-              output->buf[k * (OH * OW) + oh * OW + ow] +=
-              temp[kr * (H * W) + h * W + w];
-            }
-          }
-        }
-      }
-    }
-  }
+  // memset(output->buf, 0, N * K * OH * OW * sizeof(float));
+  CHECK_CUDA(cudaMemset(output->buf, 0, N * K * OH * OW * sizeof(float)));
+  dim3 blockDim(1, 16, 16);
+  dim3 gridDim((K + blockDim.x - 1) / blockDim.x, 
+               (H + blockDim.y - 1) / blockDim.y, 
+               (W + blockDim.z - 1) / blockDim.z);
+  reshape_kernel<<<gridDim, blockDim>>>(temp, output->buf, N, K, H, W, R, S, stride, pad, OH, OW);
+  CHECK_CUDA(cudaDeviceSynchronize());
+  // Free memory
+  CHECK_CUDA(cudaFree(wei));
+  CHECK_CUDA(cudaFree(temp));
 
   time_map["ConvTranspose2d"] += timer.elapsed();
+}
+
+// --------Transpose---------
+__global__ void transpose_kernel(float *input, float *output, size_t N, size_t C, size_t H, size_t W) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  int h = blockIdx.y * blockDim.y + threadIdx.y;
+  int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (c < C && w < W && h < H) {
+    for (size_t n = 0; n < N; n++) { 
+      size_t input_idx  = ((n * C + c) * H + h) * W + w;         // NCHW
+      size_t output_idx = ((c * N + n) * H + h) * W + w;         // CNHW
+      output[output_idx] = input[input_idx];
+    }
+  }
 }
 
 /* Transpose
@@ -389,24 +423,36 @@ void ConvTranspose2d(Tensor *input, Tensor *weight, Tensor *output,
  * Transposes the first two dimensions of the input tensor.
  */
 void transpose(Tensor *input, Tensor *output) {
+  // printf("Transpose\n");
   Timer timer;
   size_t N = input->shape[0];
   size_t C = input->shape[1];
   size_t H = input->shape[2];
   size_t W = input->shape[3];
 
-  for (size_t n = 0; n < N; n++) {
-    for (size_t c = 0; c < C; c++) {
-      for (size_t h = 0; h < H; h++) {
-        for (size_t w = 0; w < W; w++) {
-          size_t input_idx  = ((n * C + c) * H + h) * W + w;         // NCHW
-          size_t output_idx = ((c * N + n) * H + h) * W + w;         // CNHW
-          output->buf[output_idx] = input->buf[input_idx];
-        }
-      }
-    }
-  }
+  dim3 blockDim(1, 16, 16);
+  dim3 gridDim((C + blockDim.x - 1) / blockDim.x, 
+               (H + blockDim.y - 1) / blockDim.y, 
+               (W + blockDim.z - 1) / blockDim.z);
+
+  transpose_kernel<<<gridDim, blockDim>>>(input->buf, output->buf, N, C, H, W);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   time_map["transpose"] += timer.elapsed();
+}
+
+// --------Linear Layer---------
+__global__ void linear_kernel(float *in, float *w, float *b, float *out, 
+                            size_t M, size_t N, size_t K, float scale, float lr_mul) {
+  int m = blockIdx.x * blockDim.x + threadIdx.x;
+  int n = blockIdx.y * blockDim.y + threadIdx.y;
+  if (m < M && n < N) {
+    float sum = 0.0f;
+    for (size_t k = 0; k < K; k++) {
+      sum += in[m * K + k] * w[n * K + k] * scale;
+    }
+    out[m * N + n] = sum + b[n] * lr_mul;
+  }
 }
 
 /* Linear
@@ -416,7 +462,7 @@ void transpose(Tensor *input, Tensor *output) {
  * @param [out] out: [M, N]
  */
 void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
-
+  // printf("Linear\n");
   Timer timer;
   size_t M = out->shape[0];
   size_t N = out->shape[1];
@@ -424,16 +470,23 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
 
   float scale = (1.0f / sqrtf(K)) * lr_mul;
 
-  for (size_t m = 0; m < M; m++) {
-    for (size_t n = 0; n < N; n++) {
-      out->buf[m * N + n] = 0;
-      for (size_t k = 0; k < K; k++) {
-        out->buf[m * N + n] += in->buf[m * K + k] * w->buf[n * K + k] * scale;
-      }
-      out->buf[m * N + n] += b->buf[n] * lr_mul;
-    }
-  }
+  dim3 blockDim(16, 16);
+  dim3 gridDim((M + blockDim.x - 1) / blockDim.x, (N + blockDim.y - 1) / blockDim.y);
+  linear_kernel<<<gridDim, blockDim>>>(in->buf, w->buf, b->buf, out->buf, M, N, K, scale, lr_mul);
+  CHECK_CUDA(cudaDeviceSynchronize());  
+
   time_map["Linear"] += timer.elapsed();
+}
+
+// ---------LeakyReLU---------
+__global__ void leaky_relu_kernel(float *inout, float negative_slope, float scale, size_t N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    if (inout[i] < 0) {
+      inout[i] *= negative_slope;
+    }
+    inout[i] *= scale;
+  }
 }
 
 /* LeakyReLU
@@ -441,16 +494,18 @@ void Linear(Tensor *in, Tensor *w, Tensor *b, Tensor *out, float lr_mul) {
  * 'N' is the number of elements in the tensor.
  */
 void LeakyReLU(Tensor *inout) {
+  // printf("LeakyReLU\n");
   Timer timer;
   size_t N = inout->num_elem();
 
   float negative_slope = 0.2f;
   float scale = sqrtf(2.0f);
 
-  for (size_t i = 0; i < N; i++) {
-    if (inout->buf[i] < 0) { inout->buf[i] *= negative_slope; }
-    inout->buf[i] *= scale;
-  }
+  dim3 blockDim(256);
+  dim3 gridDim((N + blockDim.x - 1) / blockDim.x);
+  leaky_relu_kernel<<<gridDim, blockDim>>>(inout->buf, negative_slope, scale, N);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   time_map["LeakyReLU"] += timer.elapsed();
 }
 
@@ -471,6 +526,49 @@ void upfir2d(Tensor *input, Tensor *kernel, Tensor *output,
   time_map["upfir2d"] += timer.elapsed();
 }
 
+// ---------Modulated Convolution---------
+
+__global__ void weight_modulation_kernel(float *conv_weight, float *style_a, float *weight_a, float scale, size_t out_C, size_t in_C, size_t kernel_size) {
+  int oc = blockIdx.x * blockDim.x + threadIdx.x;
+  if (oc >= out_C) return;
+
+  for (size_t ic = 0; ic < in_C; ic++) {
+    for (size_t k = 0; k < kernel_size * kernel_size; k++) {
+      size_t idx = oc * in_C * kernel_size * kernel_size + ic * kernel_size * kernel_size + k;
+      float style_value = style_a[ic];
+      float conv_weight_value = conv_weight[idx];
+      weight_a[idx] = conv_weight_value * style_value * scale;
+    }
+  }
+}
+
+__global__ void demodulation_kernel(float *weight_a, float *demod_a, size_t out_C, size_t in_C, size_t kernel_size) {
+  int oc = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (oc < out_C) {
+    float sum = 0.0f;
+    for (size_t ic = 0; ic < in_C; ic++) {
+      for (size_t k = 0; k < kernel_size * kernel_size; k++) {
+        size_t idx = oc * in_C * kernel_size * kernel_size + ic * kernel_size * kernel_size + k;
+        sum += weight_a[idx] * weight_a[idx];
+      }
+    }
+    demod_a[oc] = 1.0f / sqrtf(sum + 1e-8f);
+  }
+}
+
+__global__ void apply_demodulation_kernel(float *weight_a, float *demod_a, size_t out_C, size_t in_C, size_t kernel_size) {
+  int oc = blockIdx.x * blockDim.x + threadIdx.x;
+  if (oc < out_C) {
+    for (size_t ic = 0; ic < in_C; ic++) {
+      for (size_t k = 0; k < kernel_size * kernel_size; k++) {
+        size_t idx = oc * in_C * kernel_size * kernel_size + ic * kernel_size * kernel_size + k;
+        weight_a[idx] *= demod_a[oc];
+      }
+    }
+  }
+}
+
 void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tensor *modulate_bias, Tensor *conv_weight, Tensor *kernel, Tensor *output,
                      Tensor *style_a, Tensor *weight_a, Tensor *demod_a, Tensor *transpose_a, Tensor *conv_a, Tensor *upsample_a, Tensor *conv2_a,
                      bool demodulate, bool upsample, int padding, int up
@@ -479,40 +577,24 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   size_t in_C = input->shape[1];
   size_t out_C = conv_weight->shape[0];
   size_t kernel_size = conv_weight->shape[2];
+  // printf("ModulatedConv2d %d %d %d\n", in_C, out_C, kernel_size);
+
 
   Linear(style, modulate_weight, modulate_bias, style_a, 1.0f);
 
   float scale = 1 / sqrtf((float) (in_C * kernel_size * kernel_size));
 
-  for (size_t oc = 0; oc < out_C; oc++) {
-    for (size_t ic = 0; ic < in_C; ic++) {
-      for (size_t k = 0; k < kernel_size * kernel_size; k++) {
-        size_t idx = oc * in_C * kernel_size * kernel_size + ic * kernel_size * kernel_size + k;
-        weight_a->buf[idx] = conv_weight->buf[idx] * style_a->buf[ic] * scale;
-      }
-    }
-  }
+  dim3 blockDim(256);
+  dim3 gridDim((out_C + blockDim.x - 1) / blockDim.x);
+
+  weight_modulation_kernel<<<gridDim, blockDim>>>(conv_weight->buf, style_a->buf, weight_a->buf, scale, out_C, in_C, kernel_size);
+  CHECK_CUDA(cudaDeviceSynchronize());
 
   if (demodulate) {
-    for (size_t oc = 0; oc < out_C; oc++) {
-      float sum = 0.0f;
-      for (size_t ic = 0; ic < in_C; ic++) {
-        for (size_t k = 0; k < kernel_size * kernel_size; k++) {
-          size_t idx = oc * in_C * kernel_size * kernel_size + ic * kernel_size * kernel_size + k;
-          sum += weight_a->buf[idx] * weight_a->buf[idx];
-        }
-      }
-      demod_a->buf[oc] = 1.0f / sqrtf(sum + 1e-8f);
-    }
-
-    for (size_t oc = 0; oc < out_C; oc++) {
-      for (size_t ic = 0; ic < in_C; ic++) {
-        for (size_t k = 0; k < kernel_size * kernel_size; k++) {
-          size_t idx = oc * in_C * kernel_size * kernel_size + ic * kernel_size * kernel_size + k;
-          weight_a->buf[idx] *= demod_a->buf[oc];
-        }
-      }
-    }
+    demodulation_kernel<<<(out_C + blockDim.x - 1) / blockDim.x, blockDim>>>(weight_a->buf, demod_a->buf, out_C, in_C, kernel_size);
+    CHECK_CUDA(cudaDeviceSynchronize());
+    apply_demodulation_kernel<<<(out_C + blockDim.x - 1) / blockDim.x, blockDim>>>(weight_a->buf, demod_a->buf, out_C, in_C, kernel_size);
+    CHECK_CUDA(cudaDeviceSynchronize());    
   }
 
   if (upsample) {
@@ -526,6 +608,19 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
   time_map["ModulatedConv2d"] += timer.elapsed();
 }
 
+
+// ---------Add Noise---------
+__global__ void addNoiseKernel(float *inout, float *noise, size_t C, size_t H, size_t W) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  int h = blockIdx.y * blockDim.y + threadIdx.y;
+  int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (c < C && h < H && w < W) {
+    size_t idx = (c * H + h) * W + w;
+    inout[idx] += noise[h * W + w];
+  }
+}
+
 /* Add noise to the input tensor
  * @param [in & out] inout: [N, C, H, W]
  * @param [in] noise: [H, W]
@@ -533,20 +628,32 @@ void ModulatedConv2d(Tensor *input, Tensor *style, Tensor *modulate_weight, Tens
  */
 
 void addNoise(Tensor *inout, Tensor *noise) {
+  // printf("addNoise\n");
   Timer timer;
   size_t C = inout->shape[1];
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
 
-  for (size_t c = 0; c < C; c++) {
-    for (size_t h = 0; h < H; h++) {
-      for (size_t w = 0; w < W; w++) {
-        size_t idx = (c * H + h) * W + w;
-        inout->buf[idx] += noise->buf[h * W + w];
-      }
-    }
-  }
+  dim3 blockDim(1, 16, 16);
+  dim3 gridDim((C + blockDim.x - 1) / blockDim.x,
+               (H + blockDim.y - 1) / blockDim.y,
+               (W + blockDim.z - 1) / blockDim.z);
+  addNoiseKernel<<<gridDim, blockDim>>>(inout->buf, noise->buf, C, H, W);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   time_map["addNoise"] += timer.elapsed();
+}
+
+// ---------Add Bias---------
+__global__ void addBiasKernel(float *inout, float *bias, size_t C, size_t H, size_t W) {
+  int c = blockIdx.x * blockDim.x + threadIdx.x;
+  int h = blockIdx.y * blockDim.y + threadIdx.y;
+  int w = blockIdx.z * blockDim.z + threadIdx.z;
+
+  if (c < C && h < H && w < W) {
+    size_t idx = (c * H + h) * W + w;
+    inout[idx] += bias[c];
+  }
 }
 
 /* Add bias to the input tensor
@@ -556,20 +663,28 @@ void addNoise(Tensor *inout, Tensor *noise) {
  */
 
 void addBias(Tensor *inout, Tensor *bias) {
+  // printf("addBias\n");
   Timer timer;
   size_t C = inout->shape[1];
   size_t H = inout->shape[2];
   size_t W = inout->shape[3];
 
-  for (size_t c = 0; c < C; c++) {
-    for (size_t h = 0; h < H; h++) {
-      for (size_t w = 0; w < W; w++) {
-        size_t idx = (c * H + h) * W + w;
-        inout->buf[idx] += bias->buf[c];
-      }
-    }
-  }
+  dim3 blockDim(1, 16, 16);
+  dim3 gridDim((C + blockDim.x - 1) / blockDim.x,
+               (H + blockDim.y - 1) / blockDim.y,
+               (W + blockDim.z - 1) / blockDim.z);
+  addBiasKernel<<<gridDim, blockDim>>>(inout->buf, bias->buf, C, H, W);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   time_map["addBias"] += timer.elapsed();
+}
+
+// -------------Element-wise addition---------
+__global__ void elemAddKernel(float *inout, float *addend, size_t N) {
+  int i = blockIdx.x * blockDim.x + threadIdx.x;
+  if (i < N) {
+    inout[i] += addend[i];
+  }
 }
 
 /*
@@ -579,12 +694,15 @@ void addBias(Tensor *inout, Tensor *bias) {
  * Adds the elements of addend to inout in-place.
  */
 void elemAdd(Tensor *inout, Tensor *addend) {
+  // printf("elemAdd\n");
   Timer timer;
   size_t N = inout->num_elem();
 
-  for (size_t i = 0; i < N; i++) {
-    inout->buf[i] += addend->buf[i];
-  }
+  dim3 blockDim(256);
+  dim3 gridDim((N + blockDim.x - 1) / blockDim.x);
+  elemAddKernel<<<gridDim, blockDim>>>(inout->buf, addend->buf, N);
+  CHECK_CUDA(cudaDeviceSynchronize());
+
   time_map["elemAdd"] += timer.elapsed();
 }
 

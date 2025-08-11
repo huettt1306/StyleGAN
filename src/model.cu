@@ -646,6 +646,16 @@ void free_activations() {
   delete block6_to_rgb_skip_upsample_a; delete block6_to_rgb_skip_conv_a;
 }
 
+#define CHECK_CUDA(call)                                                 \
+  do {                                                                   \
+    cudaError_t status_ = call;                                          \
+    if (status_ != cudaSuccess) {                                        \
+      fprintf(stderr, "CUDA error (%s:%d): %s:%s\n", __FILE__, __LINE__, \
+              cudaGetErrorName(status_), cudaGetErrorString(status_));   \
+      exit(EXIT_FAILURE);                                                \
+    }                                                                    \
+  } while (0)
+
 /* [Model Computation] */
 void generate(float *inputs, float *outputs, size_t n_samples) {  
   
@@ -685,7 +695,9 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
       LeakyReLU(mlp7_a); // mlp7_a is now the latent vector
 
       // Constant input
-      memcpy(constant_input_a->buf, constant_input->buf, 1 * 512 * 4 * 4 * sizeof(float));
+     //  fprintf(stderr, "hello?\n");
+      CHECK_CUDA(cudaMemcpy(constant_input_a->buf, constant_input->buf, 1 * 512 * 4 * 4 * sizeof(float), cudaMemcpyDefault));
+      // fprintf(stderr, "hello?\n");
 
       StyledConv(constant_input_a, mlp7_a, conv1_modulate_w, conv1_modulate_b, conv1_w, conv1_b, kernel, conv1_noise, conv1_output_a, 
                 conv1_style_a, conv1_weight_a, conv1_demod_a, nullptr, nullptr, nullptr, nullptr,
@@ -775,7 +787,7 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
             false, false, 0);
 
       /* Copy the result (512x512 RGB image) to outputs */
-      memcpy(outputs + n * 3 * 512 * 512, block6_to_rgb_output_a->buf, 3 * 512 * 512 * sizeof(float));
+      CHECK_CUDA(cudaMemcpy(outputs + n * 3 * 512 * 512, block6_to_rgb_output_a->buf, 3 * 512 * 512 * sizeof(float), cudaMemcpyDeviceToHost));
       printTimeMap();
     }
   }
