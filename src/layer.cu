@@ -126,17 +126,70 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
 }
 
 
-__global__ void mat_mul_kernel(float *A_T, float *B, float *C, int M, int N, int K) {
-  int j = blockIdx.x * blockDim.x + threadIdx.x;
-  int i = blockIdx.y * blockDim.y + threadIdx.y;
-
-  if (i < M && j < N) {
-    float sum = 0.0f;
-    for (int k = 0; k < K; ++k) {
-      sum += A_T[k * M + i] * B[k * N + j];
-    }
-    C[i * N + j] = sum;
+__global__ void mat_mul_kernel(float *A_T, float4 *B, float4 *C, int M, int N, int K) {
+  int j = blockDim.x * blockIdx.x + threadIdx.x;
+  int i = blockDim.y * blockIdx.y + threadIdx.y;
+  if (i >= M || j * 4 >= N) return;
+  float4 sum = make_float4(0, 0, 0, 0);
+  for (int k = 0; k < K; ++k) {
+    float a = A_T[k * M + i];
+    float4 b = B[k * (N / 4) + j];
+    sum = make_float4(sum.x + a * b.x, sum.y + a * b.y,
+    sum.z + a * b.z, sum.w + a * b.w);
   }
+  C[i * (N / 4) + j] = sum;
+}
+
+#define BLOCK_SIZE 16
+__global__ void mat_mul_kernel_(float *A_T, float4 *B, float4 *C, int M, int N, int K) {
+    // Index computation - each thread handles 4 elements using float4
+    int j4 = blockIdx.x * blockDim.x + threadIdx.x;  // j index in float4 units
+    int i = blockIdx.y * blockDim.y + threadIdx.y;
+    int gj = blockIdx.x, gi = blockIdx.y;
+    int lj = threadIdx.x, li = threadIdx.y;
+    
+    // Check bounds in float4 units
+    if (gi * BLOCK_SIZE >= M || gj * BLOCK_SIZE >= (N / 4)) return;
+    
+    // Shared memory allocation
+    __shared__ float Alocal[BLOCK_SIZE][BLOCK_SIZE];
+    __shared__ float4 Blocal[BLOCK_SIZE][BLOCK_SIZE];
+    float4 c = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+    
+    // Iterate over the blocks
+    for (int bk = 0; bk < K; bk += BLOCK_SIZE) {
+        // Load from global memory to shared memory
+        int Ai = gi * BLOCK_SIZE + li;
+        int Aj = bk + lj;
+        // Load from transposed A (A_T is K x M)
+        Alocal[li][lj] = (Aj < K && Ai < M) ? A_T[Aj * M + Ai] : 0.0f;
+        
+        // Load float4 from B
+        int Bi = bk + li;
+        int Bj4 = gj * BLOCK_SIZE + lj;  // j index in float4 units
+        if (Bi < K && Bj4 < (N / 4)) {
+            Blocal[li][lj] = B[Bi * (N / 4) + Bj4];
+        } else {
+            Blocal[li][lj] = make_float4(0.0f, 0.0f, 0.0f, 0.0f);
+        }
+        __syncthreads();
+        
+        // Accumulate the results in blocks
+        for (int lk = 0; lk < BLOCK_SIZE; ++lk) {
+            float a_val = Alocal[li][lk];
+            float4 b_val = Blocal[lk][lj];
+            c.x += a_val * b_val.x;
+            c.y += a_val * b_val.y;
+            c.z += a_val * b_val.z;
+            c.w += a_val * b_val.w;
+        }
+        __syncthreads();
+    }
+    
+    // Write result to global memory
+    if (i < M && j4 < (N / 4)) {
+        C[i * (N / 4) + j4] = c;
+    }
 }
 
 /*
@@ -144,16 +197,22 @@ __global__ void mat_mul_kernel(float *A_T, float *B, float *C, int M, int N, int
  * A: (M, K), B: (K, N), C: (M, N)
  */
 void mat_mul(float *A_T, float *B, float *C, int M, int N, int K) {
-  // printf("Matrix Multiplication %d %d %d\n", M, N, K);
+  printf("Matrix Multiplication %d %d %d.", M, N, K);
   Timer timer;
   
   // memset(C, 0, M * N * sizeof(float));
   CHECK_CUDA(cudaMemset(C, 0, M * N * sizeof(float)));
-  dim3 blockDim(16, 16);
-  dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
-  mat_mul_kernel<<<gridDim, blockDim>>>(A_T, B, C, M, N, K);
+  if(M < BLOCK_SIZE) {
+    dim3 blockDim(256, 1);
+    dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+    mat_mul_kernel<<<gridDim, blockDim>>>(A_T, (float4 *) B, (float4 *) C, M, N, K);
+  } else {
+    dim3 blockDim(16, 16);
+    dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
+    mat_mul_kernel_<<<gridDim, blockDim>>>(A_T, (float4 *) B, (float4 *) C, M, N, K);
+  }
   CHECK_CUDA(cudaDeviceSynchronize());
-
+  printf(" Done in %f ms\n", timer.elapsed());
   time_map["matmul"] += timer.elapsed();
 }
 
