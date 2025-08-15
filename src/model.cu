@@ -663,6 +663,11 @@ void generate(float *inputs, float *outputs, size_t n_samples) {
   MPI_Comm_rank(MPI_COMM_WORLD, &mpi_rank);
 
   if (mpi_rank == 0) {
+    // int ngpus;
+    // cudaGetDeviceCount(&ngpus);
+    // printf("Number of GPUs: %d\n", ngpus);
+
+
     for (size_t n = 0; n < n_samples; n++) {    
       /* Load a style from the inputs */
       Tensor *input = new Tensor({1, 512}, inputs + n * 512);

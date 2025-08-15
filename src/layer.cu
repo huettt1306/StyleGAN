@@ -126,14 +126,14 @@ void UpsamplePad(Tensor *input, Tensor *output, int up, int pad0, int pad1) {
 }
 
 
-__global__ void mat_mul_kernel(float *A, float *B, float *C, int M, int N, int K) {
+__global__ void mat_mul_kernel(float *A_T, float *B, float *C, int M, int N, int K) {
   int j = blockIdx.x * blockDim.x + threadIdx.x;
   int i = blockIdx.y * blockDim.y + threadIdx.y;
 
   if (i < M && j < N) {
     float sum = 0.0f;
     for (int k = 0; k < K; ++k) {
-      sum += A[i * K + k] * B[k * N + j];
+      sum += A_T[k * M + i] * B[k * N + j];
     }
     C[i * N + j] = sum;
   }
@@ -143,7 +143,7 @@ __global__ void mat_mul_kernel(float *A, float *B, float *C, int M, int N, int K
  * Matrix multiplication: C = A * B
  * A: (M, K), B: (K, N), C: (M, N)
  */
-void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
+void mat_mul(float *A_T, float *B, float *C, int M, int N, int K) {
   // printf("Matrix Multiplication %d %d %d\n", M, N, K);
   Timer timer;
   
@@ -151,7 +151,7 @@ void mat_mul(float *A, float *B, float *C, int M, int N, int K) {
   CHECK_CUDA(cudaMemset(C, 0, M * N * sizeof(float)));
   dim3 blockDim(16, 16);
   dim3 gridDim((N + blockDim.x - 1) / blockDim.x, (M + blockDim.y - 1) / blockDim.y);
-  mat_mul_kernel<<<gridDim, blockDim>>>(A, B, C, M, N, K);
+  mat_mul_kernel<<<gridDim, blockDim>>>(A_T, B, C, M, N, K);
   CHECK_CUDA(cudaDeviceSynchronize());
 
   time_map["matmul"] += timer.elapsed();
@@ -230,9 +230,9 @@ __global__ void add_padding_kernel(float *A, float *B, int K, int C, int R, int 
 
   if (k < K && j < N_) {
     if (j < N) {
-      B[k * N_ + j] = A[k * N + j];
+      B[j * K + k] = A[k * N + j];
     } else {
-      B[k * N_ + j] = 0.0f;
+      B[j * K + k] = 0.0f;
     }
   }
 }
@@ -307,10 +307,10 @@ __global__ void addPaddingTranspose_kernel(float *A, float *B, int K, int C, int
   if (k < K && c < C) {
     for (int r = 0; r < R; ++r) {
       for (int s = 0; s < S; ++s) {
-        int kr = (k * R + r) * S + s;
-        int baseB = kr * C;
+        int krs = (k * R + r) * S + s;
         int idxA = (c * K + k) * R * S + r * S + s;
-        B[baseB + c] = A[idxA];
+        int idxB = c * K * R * S + krs;
+        B[idxB] = A[idxA];
       }
     }
   }
